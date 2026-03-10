@@ -1,0 +1,16 @@
+bug,baseline,status,attempts_used,llm_calls,total_tokens,time_sec,verify_time_sec
+Lang_1,agentless,repaired,1,1,3217,80.6,28.12
+Lang_1,claude_code,repaired,3,15,27330,229.2,30.78
+Lang_1,openclaw,repaired,1,2,5110,102.8,28.05
+Lang_1,openhands,unrepaired,4,15,25529,192.3,0.0
+Lang_1,swe_agent,repaired,1,5,8462,109.8,30.65
+Lang_5,agentless,repaired,5,5,16655,207.7,31.83
+Lang_5,claude_code,repaired,1,5,8069,117.1,31.05
+Lang_5,openclaw,repaired,1,2,3843,107.1,31.34
+Lang_5,openhands,unrepaired,4,15,33739,229.9,0.0
+Lang_5,swe_agent,repaired,2,10,16601,139.7,31.5
+Math_1,agentless,unrepaired,5,5,14098,157.1,0.0
+Math_1,claude_code,repaired,2,10,31754,207.1,38.01
+Math_1,openclaw,unrepaired,5,10,12884,228.5,0.0
+Math_1,openhands,repaired,2,10,28793,212.9,37.58
+Math_1,swe_agent,repaired,3,15,26448,202.5,37.37

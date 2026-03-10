@@ -1,0 +1,47 @@
+{
+  "agentless": {
+    "baseline": "agentless",
+    "total": 3,
+    "repaired": 2,
+    "repair_rate": "66.7%",
+    "llm_calls_median": 5,
+    "tokens_median": 14098,
+    "time_median": 157.1
+  },
+  "claude_code": {
+    "baseline": "claude_code",
+    "total": 3,
+    "repaired": 3,
+    "repair_rate": "100.0%",
+    "llm_calls_median": 10,
+    "tokens_median": 27330,
+    "time_median": 207.1
+  },
+  "openclaw": {
+    "baseline": "openclaw",
+    "total": 3,
+    "repaired": 2,
+    "repair_rate": "66.7%",
+    "llm_calls_median": 2,
+    "tokens_median": 5110,
+    "time_median": 107.1
+  },
+  "openhands": {
+    "baseline": "openhands",
+    "total": 3,
+    "repaired": 1,
+    "repair_rate": "33.3%",
+    "llm_calls_median": 15,
+    "tokens_median": 28793,
+    "time_median": 212.9
+  },
+  "swe_agent": {
+    "baseline": "swe_agent",
+    "total": 3,
+    "repaired": 3,
+    "repair_rate": "100.0%",
+    "llm_calls_median": 10,
+    "tokens_median": 16601,
+    "time_median": 157.1
+  }
+}
