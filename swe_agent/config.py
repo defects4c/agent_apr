@@ -56,7 +56,14 @@ JDK_MAP = {
 }
 
 # ── Baseline names (use these strings everywhere) ──────────────────────────
-BASELINES = ["agentless", "swe_agent", "openhands", "openclaw", "claude_code"]
+# Original 5 APR agent baselines
+BASELINES_AGENT = ["agentless", "swe_agent", "openhands", "openclaw", "claude_code"]
+
+# Added: prompting-strategy baselines (adapted from prompting literature)
+BASELINES_PROMPTING = ["cot", "reflexion", "tot", "self_consistency", "got"]
+
+# Combined list used by runner.py and eval.py
+BASELINES = BASELINES_AGENT + BASELINES_PROMPTING
 
 # ── Docker configuration ───────────────────────────────────────────────────
 D4J_DOCKER_CONTAINER = os.environ.get("D4J_DOCKER_CONTAINER", "defects4j-multi")

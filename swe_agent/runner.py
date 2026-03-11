@@ -19,13 +19,26 @@ from .patch_generators.swe_agent import SWEAgentPatchGenerator
 from .patch_generators.openhands import OpenHandsPatchGenerator
 from .patch_generators.openclaw import OpenClawPatchGenerator
 from .patch_generators.claude_code import ClaudeCodePatchGenerator
+# Prompting-strategy baselines
+from .patch_generators.cot import CoTPatchGenerator
+from .patch_generators.reflexion import ReflexionPatchGenerator
+from .patch_generators.tot import ToTPatchGenerator
+from .patch_generators.self_consistency import SelfConsistencyPatchGenerator
+from .patch_generators.got import GoTPatchGenerator
 
 GENERATORS = {
+    # Original agent baselines
     "agentless": AgentlessPatchGenerator,
     "swe_agent": SWEAgentPatchGenerator,
     "openhands": OpenHandsPatchGenerator,
     "openclaw": OpenClawPatchGenerator,
     "claude_code": ClaudeCodePatchGenerator,
+    # Prompting-strategy baselines
+    "cot": CoTPatchGenerator,
+    "reflexion": ReflexionPatchGenerator,
+    "tot": ToTPatchGenerator,
+    "self_consistency": SelfConsistencyPatchGenerator,
+    "got": GoTPatchGenerator,
 }
 
 
@@ -124,6 +137,9 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path) -> dict:
                 "reason_code": "EMPTY_DIFF"
             }
             result["attempt_summaries"].append(attempt_status)
+            # Provide feedback to reflexion
+            if baseline == "reflexion" and hasattr(gen, "update_feedback"):
+                gen.update_feedback("empty_patch", "No patch was generated. Try a different approach.")
             continue
 
         # b) Budget / safety check
@@ -153,6 +169,9 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path) -> dict:
                 "reason_code": rc
             }
             result["attempt_summaries"].append(attempt_status)
+            # Provide feedback to reflexion
+            if baseline == "reflexion" and hasattr(gen, "update_feedback"):
+                gen.update_feedback("patch_apply_failed", f"Patch failed to apply: {err[:200]}")
             rollback(workdir)
             continue
 
@@ -172,6 +191,9 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path) -> dict:
                 "reason_code": rc
             }
             result["attempt_summaries"].append(attempt_status)
+            # Provide feedback to reflexion
+            if baseline == "reflexion" and hasattr(gen, "update_feedback"):
+                gen.update_feedback("build_failed", f"Compilation failed: {build_log[:200]}")
             rollback(workdir)
             continue
 
@@ -194,6 +216,9 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path) -> dict:
                 "reason_code": rc
             }
             result["attempt_summaries"].append(attempt_status)
+            # Provide feedback to reflexion
+            if baseline == "reflexion" and hasattr(gen, "update_feedback"):
+                gen.update_feedback("functionality_failed", f"Trigger tests still failing: {still_failing[:3]}")
             rollback(workdir)
             continue
 
@@ -217,6 +242,9 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path) -> dict:
                 "reason_code": rc
             }
             result["attempt_summaries"].append(attempt_status)
+            # Provide feedback to reflexion
+            if baseline == "reflexion" and hasattr(gen, "update_feedback"):
+                gen.update_feedback("regression_failed", f"New test failures: {list(new_failures)[:3]}")
             rollback(workdir)
             continue
 
