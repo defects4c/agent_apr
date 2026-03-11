@@ -25,6 +25,12 @@ from .patch_generators.reflexion import ReflexionPatchGenerator
 from .patch_generators.tot import ToTPatchGenerator
 from .patch_generators.self_consistency import SelfConsistencyPatchGenerator
 from .patch_generators.got import GoTPatchGenerator
+from .patch_generators.standard import StandardPatchGenerator
+from .patch_generators.zero_shot_cot import ZeroShotCoTPatchGenerator
+from .patch_generators.few_shot_cot import FewShotCoTPatchGenerator
+from .patch_generators.react import ReActPatchGenerator
+from .patch_generators.pot import PoTPatchGenerator
+from .patch_generators.function_calling import FunctionCallingPatchGenerator
 
 GENERATORS = {
     # Original agent baselines
@@ -39,6 +45,12 @@ GENERATORS = {
     "tot": ToTPatchGenerator,
     "self_consistency": SelfConsistencyPatchGenerator,
     "got": GoTPatchGenerator,
+    "standard": StandardPatchGenerator,
+    "zero_shot_cot": ZeroShotCoTPatchGenerator,
+    "few_shot_cot": FewShotCoTPatchGenerator,
+    "react": ReActPatchGenerator,
+    "pot": PoTPatchGenerator,
+    "function_calling": FunctionCallingPatchGenerator,
 }
 
 

@@ -59,8 +59,31 @@ JDK_MAP = {
 # Original 5 APR agent baselines
 BASELINES_AGENT = ["agentless", "swe_agent", "openhands", "openclaw", "claude_code"]
 
-# Added: prompting-strategy baselines (adapted from prompting literature)
-BASELINES_PROMPTING = ["cot", "reflexion", "tot", "self_consistency", "got"]
+# Prompting-strategy baselines (all adapted from the prompting literature)
+#   standard         — no scaffold, direct patch request          (control)
+#   zero_shot_cot    — "Let's think step by step"                 Kojima et al. NeurIPS 2022
+#   few_shot_cot     — hand-written reasoning demonstrations      Wei et al. NeurIPS 2022
+#   react            — Thought / Action / Observation loop        Yao et al. ICLR 2023
+#   reflexion        — multi-trial verbal RL + memory             Shinn et al. NeurIPS 2023
+#   self_consistency — N samples + majority / judge vote          Wang et al. ICLR 2023
+#   tot              — branch + evaluate + backtrack (BFS)        Yao et al. NeurIPS 2023
+#   got              — graph ops: generate + aggregate + refine   Besta et al. AAAI 2024
+#   pot              — model writes executable Python fix         Chen et al. TMLR 2023
+#   function_calling — structured tool-use via JSON schemas       OpenAI API (2023)
+#   cot              — step-by-step reasoning scaffold            Wei et al. / Kojima et al. 2022
+BASELINES_PROMPTING = [
+    "standard",
+    "zero_shot_cot",
+    "few_shot_cot",
+    "react",
+    "reflexion",
+    "self_consistency",
+    "tot",
+    "got",
+    "pot",
+    "function_calling",
+    "cot",
+]
 
 # Combined list used by runner.py and eval.py
 BASELINES = BASELINES_AGENT + BASELINES_PROMPTING
