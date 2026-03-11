@@ -1,33 +1,242 @@
-# Claude Code Implementation Guide
-# Multi-Baseline Agent-Based LLM Repair for Defects4J
+# Multi-Baseline Automated Program Repair for Defects4J
 
-> **How to use this file:** Drop it in your repo root. Claude Code reads it top-to-bottom and
-> implements every section in order. Sections marked `[CODE]` contain exact contracts to implement.
-> Sections marked `[PATTERN]` describe patterns derived from the reference HyperAgent implementation.
+A unified framework for evaluating **15 patch-generation strategies** on the
+[Defects4J](https://github.com/rjust/defects4j) Java bug benchmark.
+Five classical APR agent baselines are combined with ten prompting-strategy
+baselines derived from the LLM reasoning literature, all sharing the same
+infrastructure, budget controls, and evaluation pipeline.
 
 ---
 
-## 0. Shared Problem Folder — The Single Source of Truth
+## Table of Contents
 
-All five baselines (Agentless, SWE-agent, OpenHands, OpenClaw, Claude Code) read from the
-**same** problem folder. This folder is pre-built once; no baseline may write into it.
+1. [Overview](#1-overview)
+2. [Project structure](#2-project-structure)
+3. [Quick start](#3-quick-start)
+4. [Environment variables](#4-environment-variables)
+5. [Data preparation](#5-data-preparation)
+6. [The 15 baselines](#6-the-15-baselines)
+7. [Running experiments](#7-running-experiments)
+8. [Output artefacts](#8-output-artefacts)
+9. [Budget and safety constraints](#9-budget-and-safety-constraints)
+10. [Key invariants](#10-key-invariants)
+11. [Adding a new baseline](#11-adding-a-new-baseline)
+12. [Claude Code guidance](#12-claude-code-guidance)
+13. [References](#13-references)
+
+---
+
+## 1. Overview
 
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Defects4J bug (read-only)                  │
+│   data/defects4j/{Project}_{ID}/                                │
+│     ├── failing_tests     ← ground-truth trigger tests          │
+│     ├── snippet.json      ← buggy method snippets               │
+│     └── test_snippet.json ← test case snippets                  │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │  one pipeline per (baseline, bug)
+               ┌───────────▼───────────┐
+               │      runner.py        │
+               │  checkout → localize  │
+               │  → generate_patch()   │
+               │  → apply → compile    │
+               │  → func_test          │
+               │  → reg_test           │
+               └───────────┬───────────┘
+                           │
+              ┌────────────▼────────────┐
+              │  PatchGenerator         │
+              │  (one of 15 baselines)  │
+              └─────────────────────────┘
+                           │
+              ┌────────────▼────────────┐
+              │  LLMClient (shared)     │
+              │  budget · trace · log   │
+              └─────────────────────────┘
+```
+
+All baselines share:
+- the same **read-only problem data folder**
+- the same **`LLMClient`** (no direct OpenAI imports in baselines)
+- the same **budget controls** (calls, tokens, patch size)
+- the same **verify pipeline** (compile → func_test → reg_test)
+- the same **`result.json` schema** and `eval.py` aggregation
+
+---
+
+## 2. Project structure
+
+```
+.claude/
+├── guidance.md          ← Claude Code implementation spec (15 baselines)
+└── tutorial.md          ← Prompting baselines tutorial with full PoC code
+
+swe_agent/
+├── config.py            ← paths, LLM endpoint, budgets, baseline lists
+├── llm_client.py        ← single LLM wrapper for all baselines
+├── budget.py            ← BudgetManager: patch size + scope checks
+├── trace.py             ← TraceWriter: JSONL event log
+├── reason.py            ← reason-code constants (REPAIRED, BUILD_FAILED, …)
+├── defects4j.py         ← D4J CLI wrapper + bash bridge
+├── localize.py          ← fault localisation from test output
+├── apply_patch.py       ← git-apply wrapper + rollback
+├── tests_runner.py      ← func / regression test runners
+├── prepare_data.py      ← build data/defects4j/ from D4J checkouts
+├── runner.py            ← single-bug pipeline (checkout→patch→verify)
+├── eval.py              ← batch evaluation + report generation
+│
+├── tasks/
+│   ├── base.py                      ← BaseTask, Result dataclass
+│   ├── fault_localization.py        ← FaultLocalization task
+│   ├── automated_program_repair.py  ← AutomatedProgramRepair task
+│   └── utils/
+│       ├── defects4j.sh             ← bash bridge (checkout, compile, test)
+│       └── bl/sequence_utils.py     ← stack-trace utilities
+│
+└── patch_generators/
+    ├── base.py            ← PatchGenerator ABC + PatchResult dataclass
+    ├── _shared.py         ← shared prompt helpers for all prompting baselines
+    │
+    │  ── Agent baselines ──────────────────────────────────────────────────
+    ├── agentless.py       ← 1–2 LLM calls, SEARCH/REPLACE format
+    ├── swe_agent.py       ← ReAct loop with file tools
+    ├── openhands.py       ← budgeted tool-use loop
+    ├── openclaw.py        ← search → analyse → patch
+    ├── claude_code.py     ← skill-based read/search/propose
+    │
+    │  ── Prompting-strategy baselines ────────────────────────────────────
+    ├── cot.py             ← Chain-of-Thought (step-by-step scaffold)
+    ├── reflexion.py       ← Reflexion (multi-trial verbal RL + memory)
+    ├── self_consistency.py← Self-Consistency (N samples + judge vote)
+    ├── tot.py             ← Tree of Thoughts (BFS + state evaluation)
+    └── got.py             ← Graph of Thoughts (generate + aggregate + refine)
+
+benchmarks/
+├── defects4j_small.txt   ← e.g. Lang_1 … Lang_10
+└── defects4j_full.txt
+
 data/
-├── defects4j/                         ← read-only problem data
-│   ├── Lang_1/
-│   │   ├── failing_tests              ← raw D4J failure output
-│   │   ├── snippet.json               ← buggy method snippets + is_bug flags
-│   │   └── test_snippet.json          ← test case snippets + metadata
-│   ├── Lang_2/
-│   ├── Math_5/
-│   └── ...
-└── repos/                             ← live D4J checkouts (one per bug)
-    ├── Lang-1/                        ← checked out by runner, cleaned after run
-    └── Math-5/
+├── defects4j/            ← read-only problem data (built by prepare_data.py)
+└── repos/                ← live D4J checkouts (one per bug, cleaned after run)
+
+outputs/                  ← auto-created by runner.py / eval.py
 ```
 
-### `snippet.json` schema (per entry)
+---
+
+## 3. Quick start
+
+### Prerequisites
+
+| Requirement | Version |
+|---|---|
+| Python | ≥ 3.11 |
+| Java (JDK 8) | OpenJDK 8 |
+| Defects4J | ≥ 2.0 (via Docker — see below) |
+| Git | any recent version |
+
+### 1 — Clone and install
+
+```bash
+git clone <this-repo>
+cd <this-repo>
+pip install -e ".[dev]"
+```
+
+### 2 — Start the Defects4J Docker container
+
+```bash
+cd /path/to/defects4j
+docker-compose up -d
+
+# Verify
+docker-compose exec defects4j defects4j info -p Lang
+```
+
+Useful alias (add to `~/.bashrc`):
+```bash
+alias d4j='docker-compose -f ~/path/to/defects4j/docker-compose.yml \
+  exec -w /workspace defects4j defects4j'
+```
+
+### 3 — Set environment variables
+
+```bash
+export OPENAI_API_KEY="your-key"
+export OPENAI_API_BASE_URL="http://your-endpoint/v1/"
+export GPT_MODEL="gpt-4o"
+export D4J_HOME="/opt/defects4j"
+export JAVA8_HOME="/usr/lib/jvm/java-8-openjdk-amd64"
+```
+
+### 4 — Prepare problem data
+
+```bash
+python -m swe_agent.prepare_data \
+  --bugs benchmarks/defects4j_small.txt \
+  --out  data/defects4j
+```
+
+This runs once. The resulting `data/defects4j/` folder is **read-only** — no
+baseline may write into it.
+
+### 5 — Run a single bug
+
+```bash
+# One baseline
+python -m swe_agent.runner \
+  --project Lang --bug 1 --baseline agentless --out outputs
+
+# All agent baselines
+for bl in agentless swe_agent openhands openclaw claude_code; do
+  python -m swe_agent.runner --project Lang --bug 1 --baseline $bl --out outputs
+done
+
+# All prompting-strategy baselines
+for bl in cot reflexion self_consistency tot got; do
+  python -m swe_agent.runner --project Lang --bug 1 --baseline $bl --out outputs
+done
+```
+
+### 6 — Batch evaluation
+
+```bash
+python -m swe_agent.eval \
+  --bugs      benchmarks/defects4j_small.txt \
+  --baseline  agentless swe_agent openhands openclaw claude_code \
+              cot reflexion self_consistency tot got \
+  --out       outputs
+```
+
+Results are written to `outputs/report.md`, `outputs/summary.json`, and
+`outputs/summary.csv`.
+
+---
+
+## 4. Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `OPENAI_API_KEY` | `""` | API key for the LLM endpoint |
+| `OPENAI_API_BASE_URL` | `http://157.10.162.82:443/v1/` | Compatible OpenAI-format endpoint |
+| `GPT_MODEL` | `gpt-5.1` | Model name passed to the API |
+| `D4J_HOME` | `/opt/defects4j` | Defects4J installation root |
+| `D4J_FOLDER` | `data/defects4j` | Read-only problem data folder |
+| `REPOS_DIR` | `data/repos` | Live D4J checkout directory |
+| `WORKSPACE_ROOT` | `outputs` | Output root for all runs |
+| `JAVA8_HOME` | `/usr/lib/jvm/java-8-openjdk-amd64` | JDK 8 home for Lang/Math/etc. |
+| `MAX_ATTEMPTS` | `5` | Retry attempts per bug |
+
+All variables can also be set in a `.env` file at the project root.
+
+---
+
+## 5. Data preparation
+
+### `snippet.json` schema (per buggy method entry)
+
 ```json
 {
   "name":       "org.apache.commons.lang3.math.NumberUtils.createNumber",
@@ -39,2180 +248,345 @@ data/
 }
 ```
 
-### `failing_tests` format (from D4J — parse with `_load_fail_info`)
+### `failing_tests` format (ground truth, parsed by `_load_fail_info`)
+
 ```
 --- org.apache.commons.lang3.math.NumberUtilsTest::testLang300
 java.lang.StringIndexOutOfBoundsException: String index out of range: 0
-	at org.apache.commons.lang3.math.NumberUtils.createNumber(NumberUtils.java:455)
-	at org.apache.commons.lang3.math.NumberUtilsTest.testLang300(NumberUtilsTest.java:154)
+    at org.apache.commons.lang3.math.NumberUtils.createNumber(NumberUtils.java:455)
+    at org.apache.commons.lang3.math.NumberUtilsTest.testLang300(NumberUtilsTest.java:154)
 ```
 
 **Bug name convention:** `{Project}_{ID}` in filesystem, `{Project}-{ID}` in D4J CLI.
+Always convert with `.replace("_", "-", 1)` before passing to D4J commands.
 
 ---
 
-### The final objective :
- the executed result of report for different baselines, about the sucessrate, costin token , cost in time and failure case in group analysis. 
-save the execute result into swe_agent/result.md 
+## 6. The 15 baselines
 
-## 1. Full Project Layout
+### Agent baselines (5)
+
+These implement full agentic repair loops with real file-system interaction.
+
+| Baseline key | Strategy | LLM calls/attempt |
+|---|---|---|
+| `agentless` | 1–2 calls, SEARCH/REPLACE patch format | 1–2 |
+| `swe_agent` | ReAct loop with file read/write/search tools | 3–8 |
+| `openhands` | Budgeted tool-use loop (OpenHands framework) | 3–8 |
+| `openclaw` | Structured: search → analyse → patch | 3 |
+| `claude_code` | Skill-based: read → search → propose | 3 |
+
+### Prompting-strategy baselines (10)
+
+These adapt techniques from the LLM reasoning literature into the
+`PatchGenerator` interface. All go through `_shared.py` helpers for
+prompt construction and SEARCH/REPLACE extraction.
+
+| Baseline key | Paper | Venue | LLM calls/attempt | Core mechanism |
+|---|---|---|---|---|
+| `cot` | Wei et al. | NeurIPS 2022 | 1 | Step-by-step reasoning scaffold before patch output |
+| `reflexion` | Shinn et al. | NeurIPS 2023 | ≤3 | Actor → Evaluator → Reflector; sliding-window memory across attempts |
+| `self_consistency` | Wang et al. | ICLR 2023 | N+1 | N independent patches with different CoT phrasings; LLM meta-judge selects most consistent |
+| `tot` | Yao et al. | NeurIPS 2023 | 3 | Branch N candidates → state evaluation (plausible/risky/incorrect) → select best |
+| `got` | Besta et al. | AAAI 2024 | 5 | Seed → Generation ×2 → Aggregation (the GoT novelty) → Synthesis from full graph |
+| `standard`* | — (control) | — | 1 | No scaffold, direct patch request |
+| `zero_shot_cot`* | Kojima et al. | NeurIPS 2022 | 2 | "Let's think step by step" + two-stage extraction |
+| `few_shot_cot`* | Wei et al. | NeurIPS 2022 | 1 | Hand-written APR reasoning demonstrations |
+| `react`* | Yao et al. | ICLR 2023 | 1 | Thought/Action/Observation loop; patch from `Action: GeneratePatch` |
+| `pot`* | Chen et al. | TMLR 2023 | 1+exec | Model writes Python repair script; subprocess sandbox executes it |
+
+> \* These five are specified in `.claude/guidance.md` but not yet present in
+> `patch_generators/` — they are the next batch to implement. See
+> [Section 11](#11-adding-a-new-baseline) for the implementation contract.
+
+### Baseline design comparison
 
 ```
-swe_agent/                         ← Python package (note: underscore for importability)
-├── __init__.py
-├── config.py
-├── llm_client.py                  ← single LLM wrapper for ALL baselines
-├── budget.py
-├── trace.py
-├── reason.py
-├── defects4j.py                   ← D4J CLI wrapper + bash bridge
-├── localize.py
-├── apply_patch.py
-├── tests_runner.py
-│
-├── tasks/                         ← mirrors HyperAgent task structure
-│   ├── __init__.py
-│   ├── base.py                    ← BaseTask, Result (matches reference impl)
-│   ├── fault_localization.py      ← FaultLocalization (refactored from reference)
-│   └── automated_program_repair.py← AutomatedProgramRepair (refactored from reference)
-│
-├── patch_generators/
-│   ├── __init__.py
-│   ├── base.py                    ← abstract PatchGenerator interface
-│   ├── agentless.py               ← 1–2 LLM calls per attempt
-...... more baseline from .claude
-│   ├── swe_agent.py               ← ReAct loop with file tools
-│   ├── openhands.py               ← budgeted tool-use loop
-│   ├── openclaw.py                ← structured search → analyze → patch
-│   └── claude_code.py             ← skill-based read/search/propose
-│
-├── runner.py                      ← single-bug pipeline
-└── eval.py                        ← batch evaluation + report
-
-benchmarks/
-├── defects4j_small.txt            ← e.g. Lang_1 … Lang_10
-└── defects4j_full.txt
-
-outputs/                           ← auto-created
-data/
-├── defects4j/                     ← problem data (pre-built, read-only)
-└── repos/                         ← live checkouts
-```
-
----
-
-## 2. `config.py` [CODE]
-
-```python
-# swe_agent/config.py
-import os
-
-# ── Paths ──────────────────────────────────────────────────────────────────
-D4J_HOME         = os.environ.get("D4J_HOME", "/opt/defects4j")
-D4J_FOLDER       = os.environ.get("D4J_FOLDER", "data/defects4j")
-REPOS_DIR        = os.environ.get("REPOS_DIR",  "data/repos")
-WORKSPACE_ROOT   = os.environ.get("WORKSPACE_ROOT", "outputs")
-
-# ── LLM endpoint (NEVER hardcode; always read from env) ────────────────────
-OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY",      "11")
-OPENAI_API_BASE_URL = os.environ.get("OPENAI_API_BASE_URL", "http://157.10.162.82:443/v1/")
-GPT_MODEL           = os.environ.get("GPT_MODEL",           "gpt-5.1")
-
-# ── Budget (identical across ALL baselines — enforced by BudgetManager) ────
-MAX_ATTEMPTS_PER_BUG       = int(os.environ.get("MAX_ATTEMPTS", "5"))
-MAX_LLM_CALLS_PER_ATTEMPT  = 3
-MAX_LLM_CALLS_PER_BUG      = 15
-MAX_TOKENS_PER_BUG         = 200_000
-MAX_PATCH_LINES            = 200
-MAX_FILES_CHANGED          = 2
-CONTEXT_LINES_PER_LOCATION = 200
-MAX_LOCATIONS_PER_ATTEMPT  = 3
-
-# ── Timeouts (seconds) ─────────────────────────────────────────────────────
-TIMEOUT_PATCH_GEN  = 60
-TIMEOUT_COMPILE    = 120
-TIMEOUT_FUNC_TEST  = 180
-TIMEOUT_REG_TEST   = 600
-
-# ── JDK routing ────────────────────────────────────────────────────────────
-JDK_MAP = {
-    "Lang":    os.environ.get("JAVA8_HOME", "/usr/lib/jvm/java-8-openjdk-amd64"),
-    "Math":    os.environ.get("JAVA8_HOME", "/usr/lib/jvm/java-8-openjdk-amd64"),
-    "Time":    os.environ.get("JAVA8_HOME", "/usr/lib/jvm/java-8-openjdk-amd64"),
-    "Chart":   os.environ.get("JAVA8_HOME", "/usr/lib/jvm/java-8-openjdk-amd64"),
-    "Closure": os.environ.get("JAVA8_HOME", "/usr/lib/jvm/java-8-openjdk-amd64"),
-}
-
-# ── Baseline names (use these strings everywhere) ──────────────────────────
-# Original 5 APR agent baselines
-BASELINES_AGENT = ["agentless", "swe_agent", "openhands", "openclaw", "claude_code"]
-
-# Added: prompting-strategy baselines (adapted from prompting literature)
-BASELINES_PROMPTING = ["cot", "reflexion", "tot", "self_consistency", "got"]
-
-# Combined list used by runner.py and eval.py
-BASELINES = BASELINES_AGENT + BASELINES_PROMPTING
+Standard          prompt = question                        (zero overhead)
+Zero-Shot CoT     prompt = question + "Let's think..."     (Kojima et al.)
+Few-Shot CoT      prompt = [demos] + question              (Wei et al.)
+ReAct             prompt = T/A/O loop scaffold             (Yao et al.)
+Reflexion         2+ calls: Actor → Evaluator → Reflector  (Shinn et al.)
+Self-Consistency  N calls: different phrasings → vote      (Wang et al.)
+ToT               3 calls: branch → evaluate → select      (Yao et al.)
+GoT               5 calls: seed → gen → aggregate → synth  (Besta et al.)
+PoT               1 call + exec: write Python → run it     (Chen et al.)
 ```
 
 ---
 
-## 3. `tasks/base.py` [PATTERN from reference impl]
+## 7. Running experiments
 
-Refactor from the reference `FaultLocalization` / `BaseTask` pattern:
-
-```python
-# swe_agent/tasks/base.py
-import os, json
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
-
-@dataclass
-class Result:
-    task:         str
-    test_result:  str = ""        # "PASS" | "FAIL" | "ERROR"
-    result_reason: str = ""
-    proposed_patch: str = ""
-    patch_diff:   str = ""
-    kwargs:       dict = field(default_factory=dict)
-
-    def __post_init__(self):
-        # merge extra kwargs into .kwargs for backward compat
-        if "correct" in self.kwargs:
-            self.test_result = "PASS" if self.kwargs["correct"] else "FAIL"
-
-
-class BaseTask:
-    """
-    Mirrors HyperAgent BaseTask.
-    Subclasses override: setup(), construct_prompt(idx), run(system, idx), validate(...)
-    """
-    BUG_INFO_DIR: str = "data/defects4j"
-
-    def __init__(self, logdir: str, split: str, _type: str = "pred", **kwargs):
-        self.logdir    = Path(logdir)
-        self.split     = split
-        self._type     = _type
-        self.logdir.mkdir(parents=True, exist_ok=True)
-        self.setup()
-
-    def setup(self):
-        self.bug_names = sorted(os.listdir(self.BUG_INFO_DIR))
-
-    def __len__(self):
-        return len(self.bug_names)
-
-    def bug_dir(self, bug_name: str) -> Path:
-        return Path(self.BUG_INFO_DIR) / bug_name
-
-    # ── Shared data loaders ────────────────────────────────────────────────
-
-    def _load_fail_info(self, bug_name: str) -> dict:
-        """
-        Parses data/defects4j/<bug_name>/failing_tests
-        Returns: {tc_signature: {error_message, stack_trace}}
-
-        Format (from D4J):
-          --- TestClass::testMethod
-          ExceptionType: message
-          \tat frame1
-          \tat frame2
-        """
-        fail_info = {}
-        tc_signature = None
-        with open(self.bug_dir(bug_name) / "failing_tests") as f:
-            for line in f:
-                if line.startswith("--- "):
-                    tc_name = line.split()[-1]
-                    tc_signature = tc_name.replace("::", ".") + "()"
-                    fail_info[tc_signature] = {"error_message": "", "stack_trace": ""}
-                elif tc_signature:
-                    key = "stack_trace" if line.startswith("\tat") else "error_message"
-                    fail_info[tc_signature][key] += line
-        return fail_info
-
-    def _load_test_lists(self, bug_name: str) -> list[dict]:
-        with open(self.bug_dir(bug_name) / "test_snippet.json") as f:
-            return json.load(f)
-
-    def _load_snippet_data(self, bug_name: str) -> list[dict]:
-        with open(self.bug_dir(bug_name) / "snippet.json") as f:
-            return json.load(f)
-
-    def failing_test_signatures(self, fail_info: dict) -> list[str]:
-        return list(fail_info.keys())
-```
-
----
-
-## 4. `tasks/fault_localization.py` [PATTERN]
-
-Key methods to keep from reference, with LLM calls moved through `LLMClient`:
-
-```python
-# swe_agent/tasks/fault_localization.py
-from .base import BaseTask, Result
-from ..llm_client import LLMClient
-import re
-
-class FaultLocalization(BaseTask):
-
-    RANGE_REGEX = r"\(line (?P<beginline>\d+),col (?P<begincol>\d+)\)-\(line (?P<endline>\d+),col (?P<endcol>\d+)\)"
-    _MAX_REPETITION_IN_STACK = 5
-
-    TASK_TEMPLATE = """Given following failed test case, localize which method in the codebase is responsible for the failure.
-Failed Test: {test}
-The test looks like:
-
-```java
-{test_snippets}
-```
-
-It failed with the following error message and call stack:
-
-```
-{failing_traces}
-```
-
-<output>Provide the method name in the format 'package.ClassName.methodName' that you think is responsible for the failure. No need to call editor to fix the fault.</output>"""
-
-    def __init__(self, logdir, split, max_repetitions=3, max_num_tests=2, **kwargs):
-        self.max_repetitions = max_repetitions
-        self.max_num_tests   = max_num_tests
-        super().__init__(logdir, split, _type="pred", **kwargs)
-
-    def construct_prompt(self, idx: int) -> str:
-        bug_name = self.bug_names[idx]
-        fail_info = self._load_fail_info(bug_name)
-        sigs = [s for s in self.failing_test_signatures(fail_info)
-                if self.get_test_snippet(s, bug_name) is not None][:self.max_num_tests]
-        snippets = "\n\n".join(self.get_test_snippet(s, bug_name).rstrip() for s in sigs)
-        traces   = "\n\n".join(self.get_fail_info(s, bug_name, minimize=False).rstrip() for s in sigs)
-        return self.TASK_TEMPLATE.format(test=sigs, test_snippets=snippets, failing_traces=traces)
-
-    def get_fail_info(self, tc_signature: str, bug_name: str,
-                      minimize: bool = False) -> str:
-        """Returns error_message + stack_trace. If minimize=True, cleans both."""
-        fi = self._load_fail_info(bug_name)[tc_signature]
-        msg   = fi["error_message"].rstrip()
-        stack = fi["stack_trace"].rstrip()
-        if minimize:
-            msg   = "\n".join(msg.splitlines()[:5])
-            stack = self._clean_stack_trace(stack)
-        return msg + "\n" + stack
-
-    def get_test_snippet(self, signature: str, bug_name: str) -> str | None:
-        """
-        Retrieves and annotates test snippet with error location.
-        Keeps the annotation logic from the reference implementation.
-        Returns None if test case not found.
-        """
-        # ... (preserve full reference implementation logic here)
-        pass
-
-    def _clean_stack_trace(self, stack_trace: str) -> str:
-        """Remove junit.framework frames and compress repeated subsequences."""
-        # ... (preserve reference implementation logic)
-        pass
-```
-
----
-
-## 5. `tasks/automated_program_repair.py` [PATTERN]
-
-```python
-# swe_agent/tasks/automated_program_repair.py
-from .fault_localization import FaultLocalization
-from .base import Result
-
-class AutomatedProgramRepair(FaultLocalization):
-
-    TASK_TEMPLATE = """Given following failed test case, fix the code responsible for the failure. If there are multiple faults, find and fix them.
-Failed Test: {test}
-The test looks like:
-
-```java
-{test_snippets}
-```
-
-It failed with the following error message and call stack:
-
-```
-{failing_traces}
-```
-
-<output>Provide the method name in the format 'package.ClassName.methodName' that you think is responsible for the failure. You also need to edit the code to fix the fault.</output>"""
-
-    def __init__(self, logdir, **kwargs):
-        super().__init__(logdir=logdir, split=kwargs.pop("split", "test"),
-                         _type="patch", **kwargs)
-
-    def validate(self, proposed_patch: str, idx: int) -> Result:
-        """
-        Checkout buggy version → apply patch → run D4J tests → parse result.
-        Returns Result with test_result in {"PASS", "FAIL", "ERROR"}.
-        """
-        bug_name = self.bug_names[idx]
-        project, bug_id = bug_name.split("_", 1)
-
-        # apply + test via defects4j bash bridge
-        result = self._run_bash("validate_patch", project, bug_id, proposed_patch)
-
-        if result.returncode != 0:
-            reason = self._extract_error_reason(result.stderr)
-            return Result("apr", test_result="ERROR", result_reason=reason,
-                          proposed_patch=proposed_patch)
-
-        if "Failing tests: 0" in result.stdout:
-            return Result("apr", test_result="PASS", result_reason="all tests passed",
-                          proposed_patch=proposed_patch)
-
-        reason = self._run_bash("get_test_error", project, bug_id).stdout
-        return Result("apr", test_result="FAIL", result_reason=reason,
-                      proposed_patch=proposed_patch)
-
-    def report(self, results: list) -> dict:
-        counts = {"correct": 0, "incorrect": 0, "error": 0}
-        for r in results:
-            if r.test_result == "PASS":   counts["correct"]   += 1
-            elif r.test_result == "FAIL": counts["incorrect"] += 1
-            else:                          counts["error"]     += 1
-        total = len(results)
-        counts["repair_rate"] = counts["correct"] / total if total else 0.0
-        return counts
-
-    @staticmethod
-    def _extract_error_reason(stderr: str) -> str:
-        if "error: " in stderr:
-            s = stderr[stderr.find("error: "):]
-            return s[:s.find("\n")]
-        if "BUILD FAILED" in stderr:
-            lines = stderr.split("\n")
-            i = next((j for j, l in enumerate(lines) if "BUILD FAILED" in l), None)
-            return lines[i + 1].strip() if i is not None else "BUILD FAILED"
-        return "Test timed out after 600 seconds"
-```
-
----
-
-## 6. `defects4j.py` — CLI Wrapper + Bash Bridge [CODE]
-
-This mirrors `run_bash` from the reference but adds structured return types.
-
-```python
-# swe_agent/defects4j.py
-import os, subprocess
-from pathlib import Path
-from .config import D4J_HOME, REPOS_DIR, JDK_MAP, TIMEOUT_COMPILE, TIMEOUT_REG_TEST
-
-BASH_SCRIPT = "swe_agent/tasks/utils/defects4j.sh"   # port from reference's defects4j.sh
-
-
-def _env(project: str) -> dict:
-    """Build subprocess env with correct JAVA_HOME for the project."""
-    java_home = JDK_MAP.get(project, os.environ.get("JAVA_HOME", "/usr"))
-    return {**os.environ, "JAVA_HOME": java_home,
-            "PATH": f"{D4J_HOME}/framework/bin:{os.environ['PATH']}"}
-
-
-def _run(cmd: list[str], project: str, timeout: int, log_path: Path | None = None):
-    result = subprocess.run(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        universal_newlines=True, timeout=timeout, env=_env(project)
-    )
-    if log_path:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(result.stdout + "\n---STDERR---\n" + result.stderr)
-    return result
-
-
-def checkout(project: str, bug_id: int | str, version: str, workdir: Path,
-             log_path: Path | None = None):
-    """defects4j checkout -p {project} -v {bug_id}{b|f} -w {workdir}"""
-    workdir = Path(workdir)
-    workdir.mkdir(parents=True, exist_ok=True)
-    cmd = ["defects4j", "checkout",
-           "-p", project, "-v", f"{bug_id}{version}", "-w", str(workdir)]
-    r = _run(cmd, project, timeout=120, log_path=log_path)
-    if r.returncode != 0:
-        raise RuntimeError(f"Checkout failed: {r.stderr[:300]}")
-
-
-def compile(workdir: Path, project: str, log_path: Path | None = None):
-    """Returns (success: bool, log: str)"""
-    r = _run(["defects4j", "compile", "-w", str(workdir)],
-             project, TIMEOUT_COMPILE, log_path)
-    return r.returncode == 0, r.stdout + r.stderr
-
-
-def test(workdir: Path, project: str,
-         log_path: Path | None = None) -> tuple[int, list[str], str]:
-    """Returns (failing_count, failing_test_names, full_log)"""
-    r = _run(["defects4j", "test", "-w", str(workdir)],
-             project, TIMEOUT_REG_TEST, log_path)
-    log = r.stdout + r.stderr
-    # parse "Failing tests: N" and "  - ClassName::method"
-    failing_count = 0
-    failing_tests = []
-    for line in log.splitlines():
-        if line.startswith("Failing tests:"):
-            try: failing_count = int(line.split(":")[-1].strip())
-            except ValueError: pass
-        elif line.strip().startswith("- "):
-            failing_tests.append(line.strip()[2:])
-    return failing_count, failing_tests, log
-
-
-def export_trigger_tests(workdir: Path, project: str) -> list[str]:
-    r = _run(["defects4j", "export", "-p", "tests.trigger", "-w", str(workdir)],
-             project, timeout=60)
-    return [l.strip() for l in r.stdout.splitlines() if l.strip()]
-
-
-def get_modified_classes(workdir: Path, project: str) -> list[str]:
-    r = _run(["defects4j", "export", "-p", "classes.modified", "-w", str(workdir)],
-             project, timeout=60)
-    return [l.strip() for l in r.stdout.splitlines() if l.strip()]
-
-
-def run_bash(function: str, project: str, bug_id: str,
-             extra_arg1=None, extra_arg2=None):
-    """
-    Direct bridge to defects4j.sh — mirrors reference implementation's run_bash.
-    Used by AutomatedProgramRepair.validate().
-    """
-    work_dir = os.path.join(REPOS_DIR, f"{project}-{bug_id}")
-    java_home = JDK_MAP.get(project, "/usr")
-    cmd = ["bash", BASH_SCRIPT, function, project, bug_id,
-           work_dir, java_home, D4J_HOME,
-           str(extra_arg1) if extra_arg1 else "",
-           str(extra_arg2) if extra_arg2 else ""]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            universal_newlines=True)
-    if result.stdout.endswith("\n"):
-        result.stdout = result.stdout[:-1]
-    return result
-```
-
-### `defects4j.sh` (bash bridge — port from reference)
+### Single bug, single baseline
 
 ```bash
-#!/usr/bin/env bash
-# swe_agent/tasks/utils/defects4j.sh
-# Usage: defects4j.sh <function> <project> <bug_id> <work_dir> <java_home> <d4j_path> [extra1] [extra2]
-
-FUNCTION=$1; PROJECT=$2; BUG_ID=$3; WORK_DIR=$4
-export JAVA_HOME=$5
-D4J_PATH=$6
-EXTRA1=$7; EXTRA2=$8
-export PATH="$D4J_PATH/framework/bin:$JAVA_HOME/bin:$PATH"
-
-checkout_bug()    { defects4j checkout -p "$PROJECT" -v "${BUG_ID}b" -w "$WORK_DIR"; }
-compile_bug()     { cd "$WORK_DIR" && defects4j compile; }
-test_bug()        { cd "$WORK_DIR" && defects4j test; }
-validate_patch()  {
-    cd "$WORK_DIR"
-    echo "$EXTRA1" | git apply --whitespace=fix -
-    defects4j compile && defects4j test
-}
-get_patch_git_diff() { cd "$WORK_DIR" && git diff; }
-get_test_error()     { cd "$WORK_DIR" && defects4j export -p tests.trigger; }
-
-$FUNCTION
+python -m swe_agent.runner \
+  --project Lang \
+  --bug     1 \
+  --baseline agentless \
+  --out     outputs
 ```
 
----
-
-## 7. `llm_client.py` — Single LLM Wrapper [CODE]
-
-```python
-# swe_agent/llm_client.py
-import hashlib, json, time
-from datetime import datetime, timezone
-from pathlib import Path
-from openai import OpenAI
-from .config import (OPENAI_API_KEY, OPENAI_API_BASE_URL, GPT_MODEL,
-                     MAX_LLM_CALLS_PER_BUG, MAX_TOKENS_PER_BUG)
-
-
-class BudgetExceededError(Exception):
-    pass
-
-
-class LLMClient:
-    """
-    ONE instance per (baseline, bug). All baselines must use this — no direct OpenAI imports.
-    """
-    def __init__(self, baseline: str, bug_id: str):
-        self.baseline   = baseline
-        self.bug_id     = bug_id
-        self._calls     = 0
-        self._tokens    = {"prompt": 0, "completion": 0, "total": 0}
-        self._latency   = 0.0
-        self._client    = OpenAI(
-            api_key=OPENAI_API_KEY,
-            base_url=OPENAI_API_BASE_URL,
-        )
-
-    # ── Public API ──────────────────────────────────────────────────────────
-
-    def chat(self, messages: list[dict], purpose: str, attempt: int,
-             out_dir: Path, max_tokens: int = 1000) -> str:
-        self._check_budget()
-        prompt_text = json.dumps(messages)
-        prompt_hash = hashlib.sha256(prompt_text.encode()).hexdigest()
-
-        ts_start = datetime.now(timezone.utc)
-        t0 = time.monotonic()
-
-        response = self._client.chat.completions.create(
-            model=GPT_MODEL,
-            messages=messages,
-            max_tokens=max_tokens,
-        )
-
-        latency = time.monotonic() - t0
-        ts_end  = datetime.now(timezone.utc)
-
-        usage = self._parse_usage(response)
-        self._update_counters(usage, latency)
-
-        self._write_call_log(out_dir, {
-            "ts_start":    ts_start.isoformat(),
-            "ts_end":      ts_end.isoformat(),
-            "baseline":    self.baseline,
-            "bug":         self.bug_id,
-            "attempt":     attempt,
-            "purpose":     purpose,
-            "model":       GPT_MODEL,
-            "api_base":    OPENAI_API_BASE_URL,
-            "usage":       usage,
-            "latency_sec": round(latency, 3),
-            "prompt_sha256": prompt_hash,
-        })
-
-        return response.choices[0].message.content
-
-    # ── Aggregates (written into result.json) ───────────────────────────────
-
-    def summary(self) -> dict:
-        return {
-            "calls":             self._calls,
-            "prompt_tokens":     self._tokens["prompt"],
-            "completion_tokens": self._tokens["completion"],
-            "total_tokens":      self._tokens["total"],
-            "latency_sec_total": round(self._latency, 3),
-        }
-
-    # ── Internals ───────────────────────────────────────────────────────────
-
-    def _check_budget(self):
-        if self._calls >= MAX_LLM_CALLS_PER_BUG:
-            raise BudgetExceededError(
-                f"LLM call budget exceeded: {self._calls}/{MAX_LLM_CALLS_PER_BUG}")
-        if self._tokens["total"] >= MAX_TOKENS_PER_BUG:
-            raise BudgetExceededError(
-                f"Token budget exceeded: {self._tokens['total']}/{MAX_TOKENS_PER_BUG}")
-
-    def _parse_usage(self, response) -> dict:
-        u = getattr(response, "usage", None)
-        if u is None:
-            return {"prompt_tokens": 0, "completion_tokens": 0,
-                    "total_tokens": 0, "tokens_unknown": True}
-        return {"prompt_tokens":     u.prompt_tokens,
-                "completion_tokens": u.completion_tokens,
-                "total_tokens":      u.total_tokens}
-
-    def _update_counters(self, usage: dict, latency: float):
-        self._calls += 1
-        self._tokens["prompt"]     += usage.get("prompt_tokens",     0)
-        self._tokens["completion"] += usage.get("completion_tokens", 0)
-        self._tokens["total"]      += usage.get("total_tokens",      0)
-        self._latency += latency
-
-    @staticmethod
-    def _write_call_log(out_dir: Path, record: dict):
-        out_dir.mkdir(parents=True, exist_ok=True)
-        with open(out_dir / "llm_calls.jsonl", "a") as f:
-            f.write(json.dumps(record) + "\n")
-```
-
----
-
-## 8. `trace.py` and `reason.py` [CODE]
-
-### `trace.py`
-
-```python
-# swe_agent/trace.py
-import json
-from datetime import datetime, timezone
-from pathlib import Path
-
-
-class TraceWriter:
-    def __init__(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._path = path
-
-    def log(self, event: dict):
-        if "ts" not in event:
-            event["ts"] = datetime.now(timezone.utc).isoformat()
-        with open(self._path, "a") as f:
-            f.write(json.dumps(event) + "\n")
-```
-
-### `reason.py`
-
-```python
-# swe_agent/reason.py
-
-# ── Patch-apply codes ──────────────────────────────────────────────────────
-PATCH_APPLY_HUNK_FAILED    = "PATCH_APPLY_HUNK_FAILED"
-PATCH_APPLY_PATH_NOT_FOUND = "PATCH_APPLY_PATH_NOT_FOUND"
-PATCH_SIZE_EXCEEDED        = "PATCH_SIZE_EXCEEDED"
-PATCH_SCOPE_VIOLATION      = "PATCH_SCOPE_VIOLATION"
-
-# ── Build codes ────────────────────────────────────────────────────────────
-JAVAC_SYMBOL_NOT_FOUND = "JAVAC_SYMBOL_NOT_FOUND"
-JAVAC_TYPE_MISMATCH    = "JAVAC_TYPE_MISMATCH"
-MAVEN_ENFORCER         = "MAVEN_ENFORCER"
-BUILD_FAILED_UNKNOWN   = "BUILD_FAILED_UNKNOWN"
-
-# ── Test codes ─────────────────────────────────────────────────────────────
-TRIGGER_TEST_STILL_FAILING = "TRIGGER_TEST_STILL_FAILING"
-NEW_FAILURES_INTRODUCED    = "NEW_FAILURES_INTRODUCED"
-TIMEOUT_FUNC_TEST          = "TIMEOUT_FUNC_TEST"
-TIMEOUT_REG_TEST           = "TIMEOUT_REG_TEST"
-
-# ── Terminal attempt status ────────────────────────────────────────────────
-PATCH_GENERATED      = "PATCH_GENERATED"
-PATCH_APPLY_FAILED   = "PATCH_APPLY_FAILED"
-BUILD_FAILED         = "BUILD_FAILED"
-FUNCTIONALITY_FAILED = "FUNCTIONALITY_FAILED"
-REGRESSION_FAILED    = "REGRESSION_FAILED"
-TIMEOUT              = "TIMEOUT"
-REPAIRED             = "REPAIRED"
-
-
-def parse_build_reason(compiler_output: str) -> str:
-    if "cannot find symbol" in compiler_output:     return JAVAC_SYMBOL_NOT_FOUND
-    if "incompatible types"  in compiler_output:     return JAVAC_TYPE_MISMATCH
-    if "enforcer"            in compiler_output.lower(): return MAVEN_ENFORCER
-    return BUILD_FAILED_UNKNOWN
-
-
-def parse_test_reason(failing_before: set[str], failing_after: set[str]) -> str:
-    """
-    failing_before: set of trigger test names that failed pre-patch
-    failing_after:  set of ALL tests failing post-patch
-    """
-    trigger_still_failing = failing_before & failing_after
-    new_failures          = failing_after - failing_before
-    if trigger_still_failing: return TRIGGER_TEST_STILL_FAILING
-    if new_failures:          return NEW_FAILURES_INTRODUCED
-    return REPAIRED
-```
-
----
-
-## 9. `patch_generators/base.py` [CODE]
-
-```python
-# swe_agent/patch_generators/base.py
-from abc import ABC, abstractmethod
-from pathlib import Path
-from dataclasses import dataclass
-
-
-@dataclass
-class PatchResult:
-    diff_text: str          # unified diff string; "" means generation failed
-    metadata:  dict         # prompt_sha256, model, localization targets, etc.
-
-
-class PatchGenerator(ABC):
-    """Common interface all five baselines implement."""
-
-    @abstractmethod
-    def generate_patch(
-        self,
-        bug_id:            str,
-        workdir:           Path,
-        failing_info:      dict,   # {test_name: {error_message, stack_trace}}
-        trigger_tests:     list[str],
-        localization_hits: list,   # list[LocalizationHit]
-        attempt_index:     int,
-        out_dir:           Path,
-        llm_client,                # LLMClient
-    ) -> PatchResult:
-        ...
-```
-
-
-
----
-
-## 11. `runner.py` — Single-Bug Orchestration [CODE]
-
-```python
-# swe_agent/runner.py
-"""
-CLI: python -m swe_agent.runner --project Lang --bug 1 --baseline agentless --out outputs/Lang-1
-"""
-import argparse, json, time
-from pathlib import Path
-from . import config, defects4j as d4j, reason
-from .llm_client import LLMClient, BudgetExceededError
-from .budget import BudgetManager
-from .trace import TraceWriter
-from .localize import localize
-from .apply_patch import apply_patch, init_git_baseline, rollback
-from .tests_runner import run_functionality_tests, run_regression_tests, get_trigger_tests
-from .patch_generators.agentless       import AgentlessPatchGenerator
-from .patch_generators.swe_agent       import SWEAgentPatchGenerator
-from .patch_generators.openhands       import OpenHandsPatchGenerator
-from .patch_generators.openclaw        import OpenClawPatchGenerator
-from .patch_generators.claude_code     import ClaudeCodePatchGenerator
-# Prompting-strategy baselines (from prompting literature, adapted for APR)
-from .patch_generators.cot             import CoTPatchGenerator
-from .patch_generators.reflexion       import ReflexionPatchGenerator
-from .patch_generators.tot             import ToTPatchGenerator
-from .patch_generators.self_consistency import SelfConsistencyPatchGenerator
-from .patch_generators.got             import GoTPatchGenerator
-
-GENERATORS = {
-    # ── Original agent baselines ──────────────────────────────────────────
-    "agentless":        AgentlessPatchGenerator,
-    "swe_agent":        SWEAgentPatchGenerator,
-    "openhands":        OpenHandsPatchGenerator,
-    "openclaw":         OpenClawPatchGenerator,
-    "claude_code":      ClaudeCodePatchGenerator,
-    # ── Prompting-strategy baselines ──────────────────────────────────────
-    "cot":              CoTPatchGenerator,
-    "reflexion":        ReflexionPatchGenerator,
-    "tot":              ToTPatchGenerator,
-    "self_consistency": SelfConsistencyPatchGenerator,
-    "got":              GoTPatchGenerator,
-}
-
-
-def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path) -> dict:
-    bug_name = f"{project}_{bug_id}"
-    workdir  = Path(config.REPOS_DIR) / f"{project}-{bug_id}"
-    out_dir  = out_dir / baseline
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    trace   = TraceWriter(out_dir / "trace.jsonl")
-    llm     = LLMClient(baseline, bug_name)
-    budget  = BudgetManager()
-    gen     = GENERATORS[baseline]()
-
-    t_start = time.monotonic()
-    result  = {
-        "bug": bug_name, "baseline": baseline,
-        "status": "unrepaired", "attempts_used": 0,
-        "attempt_summaries": [],
-    }
-
-    # ── 1. Checkout ──────────────────────────────────────────────────────────
-    try:
-        d4j.checkout(project, bug_id, "b", workdir,
-                     log_path=out_dir / "logs" / "checkout.log")
-    except Exception as e:
-        result["status"] = "error"; result["notes"] = str(e)
-        _write_result(result, out_dir); return result
-
-    # ── 2. Pre-patch baseline ────────────────────────────────────────────────
-    n_before, failing_before, _ = d4j.test(
-        workdir, project, log_path=out_dir / "logs" / "test_before.log")
-    if n_before == 0:
-        result["notes"] = "already passing"; _write_result(result, out_dir); return result
-
-    result["failing_count_before"] = n_before
-    result["failing_tests_before"] = failing_before
-
-    trigger_tests = get_trigger_tests(workdir, project)
-    init_git_baseline(workdir)
-    loc_hits  = localize(workdir, project, (out_dir / "logs" / "test_before.log").read_text())
-    fail_info = _load_fail_info(bug_name)
-
-    # ── 3. Attempt loop ───────────────────────────────────────────────────────
-    v_time = {"apply_patch": 0.0, "compile": 0.0, "func_test": 0.0, "reg_test": 0.0}
-
-    for attempt in range(1, config.MAX_ATTEMPTS_PER_BUG + 1):
-        result["attempts_used"] = attempt
-        attempt_status = {}
-
-        # a) Generate patch
-        try:
-            patch_result = gen.generate_patch(
-                bug_name, workdir, fail_info, trigger_tests, loc_hits,
-                attempt, out_dir, llm)
-        except BudgetExceededError as e:
-            trace.log({"bug": bug_name, "baseline": baseline, "attempt": attempt,
-                       "phase": "patch_gen", "status": "FAIL",
-                       "reason_code": reason.TIMEOUT, "reason": str(e)})
-            break
-
-        _save_attempt(patch_result, attempt, out_dir)
-        if not patch_result.diff_text:
-            attempt_status = {"attempt": attempt, "status": "PATCH_GENERATED", "reason_code": "EMPTY_DIFF"}
-            result["attempt_summaries"].append(attempt_status)
-            continue
-
-        # b) Budget / safety check
-        try:
-            budget.check_patch(patch_result.diff_text)
-        except Exception as e:
-            rc = reason.PATCH_SCOPE_VIOLATION
-            trace.log(_event(bug_name, baseline, attempt, "apply_patch", "FAIL", rc, str(e)))
-            attempt_status = {"attempt": attempt, "status": reason.PATCH_APPLY_FAILED, "reason_code": rc}
-            result["attempt_summaries"].append(attempt_status); continue
-
-        # c) Apply patch
-        t0 = time.monotonic()
-        ok, err = apply_patch(patch_result.diff_text, workdir)
-        v_time["apply_patch"] += time.monotonic() - t0
-        if not ok:
-            rc = reason.PATCH_APPLY_HUNK_FAILED
-            trace.log(_event(bug_name, baseline, attempt, "apply_patch", "FAIL", rc, err))
-            attempt_status = {"attempt": attempt, "status": reason.PATCH_APPLY_FAILED, "reason_code": rc}
-            result["attempt_summaries"].append(attempt_status)
-            rollback(workdir); continue
-
-        # d) Compile
-        t0 = time.monotonic()
-        ok, build_log = d4j.compile(workdir, project,
-            log_path=out_dir / "logs" / f"attempt_{attempt:03d}_compile.log")
-        v_time["compile"] += time.monotonic() - t0
-        if not ok:
-            rc = reason.parse_build_reason(build_log)
-            trace.log(_event(bug_name, baseline, attempt, "compile", "FAIL", rc))
-            attempt_status = {"attempt": attempt, "status": reason.BUILD_FAILED, "reason_code": rc}
-            result["attempt_summaries"].append(attempt_status)
-            rollback(workdir); continue
-
-        # e) Functionality gate
-        t0 = time.monotonic()
-        n_func, still_failing, _ = run_functionality_tests(
-            workdir, trigger_tests, project,
-            log_path=out_dir / "logs" / f"attempt_{attempt:03d}_func_test.log")
-        v_time["func_test"] += time.monotonic() - t0
-        if n_func > 0:
-            rc = reason.TRIGGER_TEST_STILL_FAILING
-            trace.log(_event(bug_name, baseline, attempt, "func_test", "FAIL", rc,
-                             metrics={"failing_count": n_func, "failing_tests": still_failing}))
-            attempt_status = {"attempt": attempt, "status": reason.FUNCTIONALITY_FAILED, "reason_code": rc}
-            result["attempt_summaries"].append(attempt_status)
-            rollback(workdir); continue
-
-        # f) Regression gate
-        t0 = time.monotonic()
-        n_reg, reg_failing, _ = run_regression_tests(
-            workdir, project,
-            log_path=out_dir / "logs" / f"attempt_{attempt:03d}_reg_test.log")
-        v_time["reg_test"] += time.monotonic() - t0
-        new_failures = set(reg_failing) - set(failing_before)
-        if new_failures:
-            rc = reason.NEW_FAILURES_INTRODUCED
-            trace.log(_event(bug_name, baseline, attempt, "reg_test", "FAIL", rc,
-                             metrics={"failing_count": n_reg, "failing_tests": reg_failing}))
-            attempt_status = {"attempt": attempt, "status": reason.REGRESSION_FAILED, "reason_code": rc}
-            result["attempt_summaries"].append(attempt_status)
-            rollback(workdir); continue
-
-        # g) REPAIRED ✓
-        (out_dir / "patch.diff").write_text(patch_result.diff_text)
-        trace.log(_event(bug_name, baseline, attempt, "reg_test", "OK", reason.REPAIRED))
-        result["status"] = "repaired"
-        result["failing_count_after"] = 0
-        attempt_status = {"attempt": attempt, "status": reason.REPAIRED}
-        result["attempt_summaries"].append(attempt_status)
-        break
-
-    # ── 4. Finalize result.json ───────────────────────────────────────────────
-    v_time["total"] = sum(v_time.values())
-    result["time_sec"]              = round(time.monotonic() - t_start, 1)
-    result["llm"]                   = llm.summary()
-    result["verification_time_sec"] = {k: round(v, 2) for k, v in v_time.items()}
-    result["constraints"] = {
-        "max_attempts":          config.MAX_ATTEMPTS_PER_BUG,
-        "max_llm_calls_per_bug": config.MAX_LLM_CALLS_PER_BUG,
-        "max_tokens_per_bug":    config.MAX_TOKENS_PER_BUG,
-        "max_patch_lines":       config.MAX_PATCH_LINES,
-        "max_files_changed":     config.MAX_FILES_CHANGED,
-    }
-    result["artifacts"] = {"trace": "trace.jsonl", "llm_calls": "llm_calls.jsonl"}
-    if result["status"] == "repaired":
-        result["artifacts"]["final_patch"] = "patch.diff"
-
-    _write_result(result, out_dir)
-    return result
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-def _event(bug, baseline, attempt, phase, status, reason_code, reason_msg="", metrics=None):
-    e = {"bug": bug, "baseline": baseline, "attempt": attempt,
-         "phase": phase, "status": status,
-         "reason_code": reason_code, "reason": reason_msg}
-    if metrics: e["metrics"] = metrics
-    return e
-
-def _save_attempt(patch_result, attempt: int, out_dir: Path):
-    att_dir = out_dir / "attempts"
-    att_dir.mkdir(exist_ok=True)
-    (att_dir / f"{attempt:03d}.patch.diff").write_text(patch_result.diff_text)
-    (att_dir / f"{attempt:03d}.meta.json").write_text(
-        json.dumps(patch_result.metadata, indent=2))
-
-def _write_result(result: dict, out_dir: Path):
-    (out_dir / "result.json").write_text(json.dumps(result, indent=2))
-
-def _load_fail_info(bug_name: str) -> dict:
-    from .tasks.base import BaseTask
-    return BaseTask()._load_fail_info(bug_name)
-
-
-# ── CLI ──────────────────────────────────────────────────────────────────────
-
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--project",  required=True)
-    p.add_argument("--bug",      required=True)
-    p.add_argument("--baseline", default="agentless",
-                   choices=list(GENERATORS.keys()))
-    p.add_argument("--out",      default="outputs")
-    args = p.parse_args()
-    result = run_bug(args.project, args.bug, args.baseline,
-                     Path(args.out) / f"{args.project}-{args.bug}")
-    print(json.dumps(result, indent=2))
-
-if __name__ == "__main__":
-    main()
-```
-
----
-
-## 12. `eval.py` — Batch Evaluation + Report [CODE]
-
-```python
-# swe_agent/eval.py
-"""
-CLI:
-  python -m swe_agent.eval --bugs benchmarks/defects4j_small.txt \
-    --baseline agentless swe_agent openclaw --out outputs
-"""
-import argparse, json, csv
-from pathlib import Path
-from datetime import date
-from .runner import run_bug, GENERATORS
-
-
-def load_bug_list(path: str) -> list[tuple[str, str]]:
-    bugs = []
-    for line in Path(path).read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"): continue
-        # accept both "Lang_1" and "Lang-1"
-        sep = "_" if "_" in line else "-"
-        project, bug_id = line.split(sep, 1)
-        bugs.append((project, bug_id))
-    return bugs
-
-
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--bugs",     required=True)
-    p.add_argument("--baseline", nargs="+", default=["agentless"],
-                   choices=list(GENERATORS.keys()))
-    p.add_argument("--out",      default="outputs")
-    args = p.parse_args()
-
-    bugs    = load_bug_list(args.bugs)
-    out_dir = Path(args.out)
-    all_results: list[dict] = []
-
-    for project, bug_id in bugs:
-        for baseline in args.baseline:
-            bug_out = out_dir / f"{project}-{bug_id}"
-            print(f"  [{baseline}] {project}-{bug_id} ...", end=" ", flush=True)
-            try:
-                result = run_bug(project, bug_id, baseline, bug_out)
-            except Exception as e:
-                result = {"bug": f"{project}_{bug_id}", "baseline": baseline,
-                          "status": "error", "notes": str(e)}
-                (bug_out / baseline).mkdir(parents=True, exist_ok=True)
-                (bug_out / baseline / "result.json").write_text(json.dumps(result, indent=2))
-            print(result["status"])
-            all_results.append(result)
-
-    _write_summary(all_results, out_dir)
-    _write_report(all_results, out_dir)
-    print(f"\nReport: {out_dir}/report.md")
-
-
-def _aggregate(results: list[dict], baseline: str | None = None) -> dict:
-    subset = [r for r in results if (baseline is None or r.get("baseline") == baseline)]
-    total    = len(subset)
-    repaired = sum(1 for r in subset if r.get("status") == "repaired")
-    func_fixed = sum(1 for r in subset
-                     if r.get("status") == "repaired" or
-                     any(a.get("status") in ("FUNCTIONALITY_FAILED",) is False
-                         and a.get("status") not in ("BUILD_FAILED","PATCH_APPLY_FAILED")
-                         for a in r.get("attempt_summaries", [])))
-
-    llm_calls_list  = [r.get("llm", {}).get("calls", 0) for r in subset]
-    tokens_list     = [r.get("llm", {}).get("total_tokens", 0) for r in subset]
-    verify_list     = [r.get("verification_time_sec", {}).get("total", 0) for r in subset]
-
-    def median(lst):
-        s = sorted(lst)
-        n = len(s)
-        return round(s[n // 2], 1) if n else 0
-
-    return {
-        "baseline":   baseline or "all",
-        "total":      total,
-        "repaired":   repaired,
-        "repair_rate": f"{repaired/total*100:.1f}%" if total else "0%",
-        "llm_calls_median":   median(llm_calls_list),
-        "tokens_median":      median(tokens_list),
-        "verify_time_median": median(verify_list),
-    }
-
-
-def _write_summary(results: list[dict], out_dir: Path):
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # JSON
-    baselines = sorted({r.get("baseline","") for r in results})
-    summary = {b: _aggregate(results, b) for b in baselines}
-    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
-
-    # CSV
-    with open(out_dir / "summary.csv", "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["bug","baseline","status","attempts_used",
-                                          "llm_calls","total_tokens","verify_time_sec"])
-        w.writeheader()
-        for r in results:
-            w.writerow({
-                "bug":          r.get("bug",""),
-                "baseline":     r.get("baseline",""),
-                "status":       r.get("status",""),
-                "attempts_used": r.get("attempts_used",0),
-                "llm_calls":    r.get("llm",{}).get("calls",0),
-                "total_tokens": r.get("llm",{}).get("total_tokens",0),
-                "verify_time_sec": r.get("verification_time_sec",{}).get("total",0),
-            })
-
-
-def _write_report(results: list[dict], out_dir: Path):
-    baselines  = sorted({r.get("baseline","") for r in results})
-    aggs       = {b: _aggregate(results, b) for b in baselines}
-
-    lines = [
-        "# Defects4J Automatic Repair Report",
-        f"\nDate: {date.today().isoformat()}",
-        "",
-        "## Summary",
-        "",
-        "| Baseline | Attempted | Repaired | Repair rate | LLM calls/bug (med) | Tokens/bug (med) | Verify time/bug (med) |",
-        "|:---------|----------:|---------:|------------:|--------------------:|-----------------:|----------------------:|",
-    ]
-    for b, ag in aggs.items():
-        lines.append(
-            f"| {b} | {ag['total']} | {ag['repaired']} | {ag['repair_rate']} "
-            f"| {ag['llm_calls_median']} | {ag['tokens_median']} | {ag['verify_time_median']}s |"
-        )
-
-    for baseline in baselines:
-        subset   = [r for r in results if r.get("baseline") == baseline]
-        repaired = [r for r in subset if r.get("status") == "repaired"]
-        failed   = [r for r in subset if r.get("status") != "repaired"]
-
-        lines += ["", f"## Repaired — {baseline}"]
-        for r in repaired:
-            att = r.get("attempts_used", "?")
-            t   = r.get("time_sec", "?")
-            lines.append(f"- {r['bug']} (attempt {att}, {t}s)")
-
-        lines += [f"## Unrepaired / Errors — {baseline}"]
-        for r in failed:
-            last = (r.get("attempt_summaries") or [{}])[-1]
-            rc   = last.get("reason_code", r.get("notes",""))
-            lines.append(f"- {r['bug']} — {rc}")
-
-    (out_dir / "report.md").write_text("\n".join(lines))
-
-
-if __name__ == "__main__":
-    main()
-```
-
----
-
-## 13. Implementation Order for Claude Code
-
-Implement modules in this exact sequence to avoid import errors:
-
-| Step | File | Key dependency |
-|------|------|---------------|
-| 1 | `config.py` | none |
-| 2 | `reason.py` | none |
-| 3 | `trace.py` | none |
-| 4 | `budget.py` | config |
-| 5 | `llm_client.py` | config, trace, budget |
-| 6 | `tasks/base.py` | none |
-| 7 | `tasks/fault_localization.py` | tasks/base |
-| 8 | `tasks/automated_program_repair.py` | tasks/fault_localization |
-| 9 | `defects4j.py` + `defects4j.sh` | config |
-| 10 | `localize.py` | defects4j, tasks/base |
-| 11 | `apply_patch.py` | budget |
-| 12 | `tests_runner.py` | defects4j |
-| 13 | `patch_generators/base.py` | none |
-| 14 | `patch_generators/_shared.py` | base — shared helpers for all prompting baselines |
-| 15 | `patch_generators/agentless.py` | base, llm_client |
-| 16 | `patch_generators/swe_agent.py` | base, llm_client |
-| 17 | `patch_generators/openhands.py` | base, llm_client |
-| 18 | `patch_generators/openclaw.py` | base, llm_client |
-| 19 | `patch_generators/claude_code.py` | base, llm_client |
-| 20 | `patch_generators/cot.py` | base, _shared, llm_client |
-| 21 | `patch_generators/reflexion.py` | base, _shared, llm_client |
-| 22 | `patch_generators/tot.py` | base, _shared, llm_client |
-| 23 | `patch_generators/self_consistency.py` | base, _shared, llm_client, config |
-| 24 | `patch_generators/got.py` | base, _shared, llm_client |
-| 25 | `runner.py` | all above |
-| 26 | `eval.py` | runner |
-
----
-
-## 14. CLI Quick Reference
+### Single bug, compare all baselines
 
 ```bash
-# Single bug, single baseline
-python -m swe_agent.runner --project Lang --bug 1 --baseline agentless --out outputs
-
-# Single bug, all agent baselines
-for bl in agentless swe_agent openhands openclaw claude_code; do
-  python -m swe_agent.runner --project Lang --bug 1 --baseline $bl --out outputs
+for bl in agentless swe_agent openhands openclaw claude_code \
+          cot reflexion self_consistency tot got; do
+  python -m swe_agent.runner \
+    --project Lang --bug 1 --baseline $bl --out outputs
 done
+```
 
-# Single bug, all prompting-strategy baselines
-for bl in cot reflexion tot self_consistency got; do
-  python -m swe_agent.runner --project Lang --bug 1 --baseline $bl --out outputs
-done
+### Batch run
 
-# Batch run, all 10 baselines
+```bash
+# Small benchmark (10 bugs)
 python -m swe_agent.eval \
-  --bugs benchmarks/defects4j_small.txt \
+  --bugs     benchmarks/defects4j_small.txt \
+  --baseline agentless cot reflexion tot got \
+  --out      outputs
+
+# Full benchmark
+python -m swe_agent.eval \
+  --bugs     benchmarks/defects4j_full.txt \
   --baseline agentless swe_agent openhands openclaw claude_code \
-             cot reflexion tot self_consistency got \
-  --out outputs
+             cot reflexion self_consistency tot got \
+  --out      outputs
+```
+
+### Inspect results
+
+```bash
+# Per-bug JSON
+cat outputs/Lang-1/agentless/result.json
+
+# LLM call log
+cat outputs/Lang-1/agentless/llm_calls.jsonl
+
+# Event trace
+cat outputs/Lang-1/agentless/trace.jsonl
+
+# Applied patch
+cat outputs/Lang-1/agentless/patch.diff
+
+# Batch summary
+cat outputs/report.md
+cat outputs/summary.csv
 ```
 
 ---
 
-## 15. Key Invariants — Never Violate
+## 8. Output artefacts
 
-1. **One LLM client.** No baseline imports `openai` directly.
+Every `runner.py` run for `(bug, baseline)` produces:
+
+```
+outputs/{Project}-{ID}/{baseline}/
+├── result.json            ← status, attempts, LLM usage, timing
+├── trace.jsonl            ← per-phase events (apply, compile, test, …)
+├── llm_calls.jsonl        ← every LLM call with timing, tokens, sha256
+├── patch.diff             ← final accepted patch (only if repaired)
+├── attempts/
+│   ├── 001.patch.diff     ← patch from attempt 1
+│   ├── 001.meta.json      ← metadata from attempt 1
+│   └── ...
+└── logs/
+    ├── checkout.log
+    ├── test_before.log
+    ├── attempt_001_compile.log
+    ├── attempt_001_func_test.log
+    └── attempt_001_reg_test.log
+```
+
+`result.json` schema:
+
+```json
+{
+  "bug":             "Lang_1",
+  "baseline":        "agentless",
+  "status":          "repaired",
+  "attempts_used":   2,
+  "attempt_summaries": [
+    {"attempt": 1, "status": "BUILD_FAILED", "reason_code": "JAVAC_SYMBOL_NOT_FOUND"},
+    {"attempt": 2, "status": "REPAIRED"}
+  ],
+  "failing_count_before": 1,
+  "failing_count_after":  0,
+  "time_sec": 38.4,
+  "llm": {
+    "calls": 3,
+    "prompt_tokens": 4200,
+    "completion_tokens": 820,
+    "total_tokens": 5020,
+    "latency_sec_total": 12.1
+  },
+  "verification_time_sec": {
+    "apply_patch": 0.1,
+    "compile":     6.2,
+    "func_test":   8.9,
+    "reg_test":   22.1,
+    "total":       37.3
+  }
+}
+```
+
+Batch `eval.py` additionally writes:
+
+| File | Contents |
+|---|---|
+| `outputs/report.md` | Human-readable repair summary per baseline + failure analysis |
+| `outputs/summary.json` | Aggregated stats per baseline (repair rate, median tokens, median time) |
+| `outputs/summary.csv` | Per-bug, per-baseline flat table for plotting |
+
+---
+
+## 9. Budget and safety constraints
+
+All limits are defined in `config.py` and enforced by `BudgetManager` and `LLMClient`.
+
+| Constraint | Default | Config key |
+|---|---|---|
+| Attempts per bug | 5 | `MAX_ATTEMPTS_PER_BUG` |
+| LLM calls per attempt | 3 | `MAX_LLM_CALLS_PER_ATTEMPT` |
+| LLM calls per bug total | 15 | `MAX_LLM_CALLS_PER_BUG` |
+| Tokens per bug total | 200,000 | `MAX_TOKENS_PER_BUG` |
+| Patch lines | 200 | `MAX_PATCH_LINES` |
+| Files changed per patch | 2 | `MAX_FILES_CHANGED` |
+| Source lines per location | 200 | `CONTEXT_LINES_PER_LOCATION` |
+| Patch generation timeout | 60 s | `TIMEOUT_PATCH_GEN` |
+| Compile timeout | 120 s | `TIMEOUT_COMPILE` |
+| Trigger test timeout | 180 s | `TIMEOUT_FUNC_TEST` |
+| Regression test timeout | 600 s | `TIMEOUT_REG_TEST` |
+
+`self_consistency.py` automatically caps `n_samples` at
+`MAX_LLM_CALLS_PER_ATTEMPT - 1` to leave room for the judge call.
+
+---
+
+## 10. Key invariants
+
+These must never be violated across any baseline:
+
+1. **One LLM client.** No baseline imports `openai` directly (except `function_calling.py`
+   which needs the `tools=` parameter; extend `LLMClient.chat_with_tools()` to unify).
 2. **Budget before every call and every patch apply.**
-3. **Rollback after every failed attempt** — workspace clean before next attempt.
-4. **Pre-patch run mandatory** — `test_before.log` must exist for every bug.
+3. **Rollback after every failed attempt** — workspace must be clean before the next attempt.
+4. **Pre-patch baseline run mandatory** — `test_before.log` must exist before any patching.
 5. **Functionality gate before regression gate** — never run full suite if trigger tests still fail.
-6. **All timing via `time.monotonic()`.**
-7. **`result.json` written even on error.**
-8. **Problem folder (`data/defects4j/`) is read-only** — never written by any baseline.
-9. **`failing_tests` file is the ground truth** — parsed identically by all baselines via `_load_fail_info`.
-10. **Bug name convention:** `Project_ID` in filesystem, `Project-ID` in D4J CLI — convert with `replace("_","-",1)`.
-11. **Stateful baselines (`reflexion`) are instantiated once per bug** — `runner.py` calls `GENERATORS[baseline]()` fresh per bug, which is already correct.
-12. **`self_consistency` call count** — `n_samples` is capped at `MAX_LLM_CALLS_PER_ATTEMPT - 1` to leave room for the judge call.
-13. **GoT synthesis must include the graph summary** — passing only `fail_ctx` to the synthesis call discards all graph reasoning. Always pass `g.summary()`.
-14. **`_shared.py` is the single source of prompt helpers** — do not duplicate `PATCH_SYSTEM`, `extract_search_replace`, or context builders in individual baseline files.
-
-
-
-
-## 16. Some references for how to fix and call the defects4j 
-```
-ls 
-/home/taicen/wangjian/defects4c_dirs/agent_apr/Agentless
-/home/taicen/wangjian/defects4c_dirs/agent_apr/RepairAgent
-
-/home/taicen/wangjian/defects4c_dirs/agent_apr/SWE-agent
-/home/taicen/wangjian/defects4c_dirs/agent_apr/OpenHands
-
-
-uv pip list
-openhands                                1.13.0
-sweagent                  1.1.0       /home/taicen/wangjian/defects4c_dirs/agent_apr/SWE-agent
-```
-
-** How to use defects4j  **
-
-```
-(env_defects4j) (base) taicen@GPU-23:~/wangjian/defects4c_dirs/agent_apr/defects4j$ docker-compose exec defects4j defects4j info -p Chart 
-Summary of configuration for Project: Chart
---------------------------------------------------------------------------------
-    Script dir: /defects4j/framework
-      Base dir: /defects4j
-    Major root: /defects4j/major
-      Repo dir: /defects4j/project_repos
---------------------------------------------------------------------------------
-    Project ID: Chart
-       Program: jfreechart
-    Build file: /defects4j/framework/projects/Chart/Chart.build.xml
---------------------------------------------------------------------------------
-           Vcs: Vcs::Svn
-    Repository: file:///defects4j/project_repos/jfreechart/trunk
-     Commit db: /defects4j/framework/projects/Chart/active-bugs.csv
-Number of bugs: 26
---------------------------------------------------------------------------------
-(env_defects4j) (base) taicen@GPU-23:~/wangjian/defects4c_dirs/agent_apr/defects4j$ docker-compose exec defects4j defects4j checkout -p Math -v 1b -w /workspace/math_1
-
-Checking out 86545dab to /workspace/math_1................................. OK
-Init local repository...................................................... OK
-Tag post-fix revision...................................................... OK
-Run post-checkout hook..................................................... OK
-Excluding broken/flaky tests............................................... OK
-Excluding broken/flaky tests............................................... OK
-Excluding broken/flaky tests............................................... OK
-Initialize fixed program version........................................... OK
-Apply patch................................................................ OK
-Initialize buggy program version........................................... OK
-Diff 86545dab:d7fd760e..................................................... OK
-Apply patch................................................................ OK
-Tag pre-fix revision....................................................... OK
-Check out program version: Math-1b......................................... OK
-(env_defects4j) (base) taicen@GPU-23:~/wangjian/defects4c_dirs/agent_apr/defects4j$ docker-compose exec -w /workspace/math_1 defects4j defects4j compile
-Running ant (compile)...................................................... OK
-Running ant (compile.tests)................................................ OK
-(env_defects4j) (base) taicen@GPU-23:~/wangjian/defects4c_dirs/agent_apr/defects4j$ docker-compose exec -w /workspace/math_1 defects4j defects4j test
-Running ant (compile.tests)................................................ OK
-Running ant (run.dev.tests)................................................ 
-
-
-
-
-
-
-OK
-Failing tests: 2
-  - org.apache.commons.math3.fraction.BigFractionTest::testDigitLimitConstructor
-  - org.apache.commons.math3.fraction.FractionTest::testDigitLimitConstructor
-(env_defects4j) (base) taicen@GPU-23:~/wangjian/defects4c_dirs/agent_apr/defects4j$ alias d4j='docker-compose -f ~/wangjian/defects4c_dirs/agent_apr/defects4j/docker-compose.yml exec -w /workspace defects4j defects4j'
-(env_defects4j) (base) taicen@GPU-23:~/wangjian/defects4c_dirs/agent_apr/defects4j$ 
-
-
-
-
-(env_defects4j) (base) taicen@GPU-23:~/wangjian/defects4c_dirs/agent_apr$ docker-compose exec defects4j defects4j info -p Chart 
-(env_defects4j) (base) taicen@GPU-23:~/wangjian/defects4c_dirs/agent_apr$ d4j info -p Chart 
-Summary of configuration for Project: Chart
---------------------------------------------------------------------------------
-    Script dir: /defects4j/framework
-      Base dir: /defects4j
-    Major root: /defects4j/major
-      Repo dir: /defects4j/project_repos
---------------------------------------------------------------------------------
-    Project ID: Chart
-       Program: jfreechart
-    Build file: /defects4j/framework/projects/Chart/Chart.build.xml
---------------------------------------------------------------------------------
-           Vcs: Vcs::Svn
-    Repository: file:///defects4j/project_repos/jfreechart/trunk
-     Commit db: /defects4j/framework/projects/Chart/active-bugs.csv
-Number of bugs: 26
---------------------------------------------------------------------------------
-(env_defects4j) (base) taicen@GPU-23:~/wangjian/defects4c_dirs/agent_apr$ 
-
-```
-
-
-
-
-
-## 10. More Baseline Implementations
-
-These five baselines adapt the prompting strategies from the academic literature
-(`Chain-of-Thought`, `Reflexion`, `Tree of Thoughts`, `Self-Consistency`, `Graph of Thoughts`)
-into `PatchGenerator` subclasses that plug directly into `runner.py` and `eval.py`.
-
-Every class follows the same `generate_patch(...)` contract defined in `patch_generators/base.py`.
-All LLM calls go through the shared `LLMClient` — no direct API imports.
+6. **All timing via `time.monotonic()`** — no `datetime` arithmetic for durations.
+7. **`result.json` written even on error** — pipeline must not silently swallow exceptions.
+8. **Problem folder is read-only** — `data/defects4j/` is never written by any baseline.
+9. **`failing_tests` is ground truth** — parsed identically by all baselines via `_load_fail_info`.
+10. **Bug name convention** — `Project_ID` in filesystem, `Project-ID` in D4J CLI.
+11. **Stateful baselines (`reflexion`) are instantiated once per bug** — `GENERATORS[bl]()`
+    is called fresh inside `run_bug()` for each bug.
+12. **GoT synthesis must include the full graph summary** — passing only `fail_ctx`
+    discards all graph reasoning.
+13. **PoT repair script runs via subprocess** — never bare `exec()`.
+14. **`_shared.py` is the single source of prompt helpers** — do not duplicate
+    `PATCH_SYSTEM`, `extract_search_replace`, or context builders in baseline files.
 
 ---
 
-### Shared prompt helpers (put in `patch_generators/_shared.py`)
+## 11. Adding a new baseline
+
+1. Create `swe_agent/patch_generators/my_baseline.py` implementing `PatchGenerator`:
 
 ```python
-# swe_agent/patch_generators/_shared.py
-"""
-Common prompt building blocks reused across prompting-strategy baselines.
-"""
-import re
-
-
-# ── Context builders ──────────────────────────────────────────────────────────
-
-def build_fail_context(bug_id: str, trigger_tests: list[str],
-                       failing_info: dict, max_chars: int = 3000) -> str:
-    """Format failing test info into a compact context block."""
-    traces = "\n\n".join(
-        (fi["error_message"] + "\n" + fi["stack_trace"])[:1000]
-        for fi in failing_info.values()
-    )
-    clean_tests = [t for t in trigger_tests if "::" in t or "." in t]
-    return (
-        f"Bug: {bug_id}\n"
-        f"Failing tests: {', '.join(clean_tests[:3])}\n\n"
-        f"Error output:\n{traces[:max_chars]}"
-    )
-
-
-def build_location_context(localization_hits: list,
-                            workdir, max_hits: int = 3) -> str:
-    """Read source snippets for the top-N localization hits."""
-    from pathlib import Path
-    blocks = []
-    for h in localization_hits[:max_hits]:
-        fp = Path(workdir) / h.filepath
-        if fp.exists():
-            try:
-                lines = fp.read_text().splitlines()
-                s = max(0, h.start_line - 1)
-                e = min(len(lines), h.end_line + 1)
-                numbered = "\n".join(
-                    f"{h.start_line + i}: {l}"
-                    for i, l in enumerate(lines[s:e])
-                )
-                blocks.append(
-                    f"### {h.filepath} lines {h.start_line}-{h.end_line}\n"
-                    f"```java\n{numbered}\n```"
-                )
-            except Exception:
-                blocks.append(f"### {h.filepath} (unreadable)")
-        else:
-            blocks.append(f"### {h.filepath} (not found)")
-    return "\n\n".join(blocks)
-
-
-# ── Output parsers ────────────────────────────────────────────────────────────
-
-SEARCH_REPLACE_RE = re.compile(
-    r'FILE:\s*(\S+)\s*SEARCH:\s*(.*?)\s*REPLACE:\s*(.*?)(?=\nFILE:|\Z)',
-    re.DOTALL,
-)
-
-def extract_search_replace(text: str) -> str:
-    """Return the first valid SEARCH/REPLACE block, or '' if none found."""
-    m = SEARCH_REPLACE_RE.search(text)
-    if not m:
-        return ""
-    return f"FILE: {m.group(1)}\nSEARCH: {m.group(2).strip()}\nREPLACE: {m.group(3).strip()}"
-
-
-# ── Common system prompt ──────────────────────────────────────────────────────
-
-PATCH_SYSTEM = """You are an automated Java program repair system.
-
-Output format — use EXACTLY this structure, no markdown fences around it:
-
-FILE: path/to/File.java
-SEARCH: <exact source lines to replace — must match the file character-for-character>
-REPLACE: <corrected lines>
-
-Rules:
-- SEARCH must be a verbatim copy of existing source including all whitespace and indentation.
-- Include 5-10 lines of context around the changed lines so the match is unique.
-- Fix only the buggy logic; do not modify unrelated code.
-- When you see a stack trace, the bug is in the CALLER, not the called method."""
-```
-
----
-
-### 10a. `patch_generators/cot.py` — Chain-of-Thought
-
-**Paper:** Wei et al., NeurIPS 2022 (few-shot CoT); Kojima et al., NeurIPS 2022 (zero-shot CoT).
-
-**APR design:** Prefix the patch-generation prompt with an explicit step-by-step reasoning
-scaffold before the model outputs the SEARCH/REPLACE patch. This surfaces intermediate
-reasoning (root-cause → fix strategy → implementation) in the trace log and tends to
-produce better-justified patches on non-trivial bugs.
-
-```
-Call 1  →  [context] + "reason step by step, then output patch"
-           model writes: Step 1: ... Step 2: ... SEARCH/REPLACE block
-```
-
-```python
-# swe_agent/patch_generators/cot.py
-"""
-Chain-of-Thought patch generator.
-Paper: Wei et al. (NeurIPS 2022), Kojima et al. (NeurIPS 2022)
-Strategy: one call — step-by-step reasoning scaffold before the patch output.
-Budget: 1 LLM call per attempt (cheapest structured reasoning baseline).
-"""
+# swe_agent/patch_generators/my_baseline.py
 from pathlib import Path
 from .base import PatchGenerator, PatchResult
-from ._shared import (build_fail_context, build_location_context,
-                       extract_search_replace, PATCH_SYSTEM)
+from ._shared import build_fail_context, build_location_context, \
+                     extract_search_replace, PATCH_SYSTEM
 
-
-USER_TEMPLATE = """{fail_context}
-
-## Suspicious location(s)
-{location_context}
-
-## Task
-Reason step by step before writing the patch.
-
-Step 1 — Root cause: explain what is wrong and why the test fails.
-Step 2 — Fix strategy: describe the minimal code change that corrects the bug.
-Step 3 — Implementation: write the patch.
-
-Then output the patch using EXACTLY this format:
-
-FILE: path/to/File.java
-SEARCH: <exact lines>
-REPLACE: <corrected lines>
-"""
-
-
-class CoTPatchGenerator(PatchGenerator):
+class MyBaselinePatchGenerator(PatchGenerator):
 
     def generate_patch(
         self,
         bug_id, workdir, failing_info, trigger_tests,
         localization_hits, attempt_index, out_dir, llm_client,
     ) -> PatchResult:
-
         fail_ctx = build_fail_context(bug_id, trigger_tests, failing_info)
         loc_ctx  = build_location_context(localization_hits, workdir)
 
-        prompt   = USER_TEMPLATE.format(
-            fail_context=fail_ctx,
-            location_context=loc_ctx,
-        )
-        messages = [
-            {"role": "system", "content": PATCH_SYSTEM},
-            {"role": "user",   "content": prompt},
-        ]
+        # ... your prompt strategy ...
 
         response = llm_client.chat(
-            messages, purpose="cot_patch_gen",
-            attempt=attempt_index, out_dir=out_dir, max_tokens=1500,
-        )
-
-        diff = extract_search_replace(response or "")
-        return PatchResult(
-            diff_text=diff,
-            metadata={"strategy": "cot", "raw_response": response or ""},
-        )
-```
-
----
-
-### 10b. `patch_generators/reflexion.py` — Reflexion
-
-**Paper:** Shinn et al., NeurIPS 2023.
-
-**APR design:** Three-stage loop within a single attempt's LLM budget.
-Stage 1 (Actor) generates a patch with CoT. Stage 2 (Evaluator) checks whether
-the patch is self-consistent. Stage 3 (Reflector) writes a verbal reflection
-and produces a revised patch. Reflections are stored in a memory buffer and
-included in subsequent attempts so the model learns from earlier failures.
-
-```
-Call 1  →  Actor:    CoT prompt → initial patch
-Call 2  →  Evaluator: "is this patch logically correct?" → yes/no + reason
-Call 3  →  Reflector: initial patch + eval feedback + memory → revised patch
-```
-
-```python
-# swe_agent/patch_generators/reflexion.py
-"""
-Reflexion patch generator.
-Paper: Shinn et al., NeurIPS 2023 (arXiv:2303.11366)
-Strategy:
-  Call 1 — Actor generates an initial patch (CoT).
-  Call 2 — Evaluator checks the patch for logical consistency.
-  Call 3 — Reflector critiques + revises using memory of past reflections.
-Budget: up to 3 LLM calls per attempt; memory persists across attempts.
-"""
-from pathlib import Path
-from .base import PatchGenerator, PatchResult
-from ._shared import (build_fail_context, build_location_context,
-                       extract_search_replace, PATCH_SYSTEM)
-
-
-ACTOR_TEMPLATE = """{fail_context}
-
-## Suspicious location(s)
-{location_context}
-
-{memory_block}
-
-Reason step by step, then output the patch:
-
-FILE: path/to/File.java
-SEARCH: <exact lines>
-REPLACE: <corrected lines>
-"""
-
-EVAL_TEMPLATE = """You are reviewing a proposed Java patch for bug {bug_id}.
-
-## Patch
-{patch}
-
-## Failing test context
-{fail_context}
-
-Does this patch correctly fix the root cause without breaking other behaviour?
-Respond with:
-Verdict: CORRECT | WRONG | UNCERTAIN
-Reason: <one sentence>
-"""
-
-REFLECT_TEMPLATE = """You proposed this patch for bug {bug_id}:
-
-{patch}
-
-The evaluator said:
-{eval_result}
-
-Previous reflections (if any):
-{memory_block}
-
-1. Reflection: <what specifically is wrong with the previous patch>
-2. Revised patch — output using EXACTLY this format:
-
-FILE: path/to/File.java
-SEARCH: <exact lines>
-REPLACE: <corrected lines>
-"""
-
-
-class ReflexionPatchGenerator(PatchGenerator):
-    """
-    Maintains an episodic memory buffer of verbal reflections across attempts.
-    The buffer is cleared when a new bug starts (one instance per bug in runner.py).
-    """
-
-    def __init__(self):
-        self._memory: list[str] = []   # episodic buffer — persists across attempts
-
-    def generate_patch(
-        self,
-        bug_id, workdir, failing_info, trigger_tests,
-        localization_hits, attempt_index, out_dir, llm_client,
-    ) -> PatchResult:
-
-        fail_ctx = build_fail_context(bug_id, trigger_tests, failing_info)
-        loc_ctx  = build_location_context(localization_hits, workdir)
-        mem_block = (
-            "Memory from previous attempts:\n" +
-            "\n".join(f"- {m}" for m in self._memory[-3:])  # sliding window of 3
-            if self._memory else ""
-        )
-
-        # ── Call 1: Actor ─────────────────────────────────────────────────────
-        actor_prompt = ACTOR_TEMPLATE.format(
-            fail_context=fail_ctx, location_context=loc_ctx,
-            memory_block=mem_block,
-        )
-        initial_response = llm_client.chat(
             [{"role": "system", "content": PATCH_SYSTEM},
-             {"role": "user",   "content": actor_prompt}],
-            purpose="reflexion_actor", attempt=attempt_index,
+             {"role": "user",   "content": f"{fail_ctx}\n{loc_ctx}"}],
+            purpose="my_baseline", attempt=attempt_index,
             out_dir=out_dir, max_tokens=1500,
         )
-        initial_patch = extract_search_replace(initial_response or "")
-
-        if not initial_patch:
-            # Nothing to reflect on — return empty
-            return PatchResult(diff_text="",
-                               metadata={"strategy": "reflexion", "stage": "actor_failed"})
-
-        # ── Call 2: Evaluator ────────────────────────────────────────────────
-        eval_response = llm_client.chat(
-            [{"role": "user", "content": EVAL_TEMPLATE.format(
-                bug_id=bug_id, patch=initial_patch, fail_context=fail_ctx,
-            )}],
-            purpose="reflexion_evaluator", attempt=attempt_index,
-            out_dir=out_dir, max_tokens=300,
-        )
-
-        verdict = "CORRECT"
-        for line in (eval_response or "").splitlines():
-            if line.lower().startswith("verdict:"):
-                verdict = line.split(":", 1)[-1].strip().upper()
-                break
-
-        # If evaluator is confident the patch is correct, skip reflection
-        if verdict == "CORRECT":
-            return PatchResult(
-                diff_text=initial_patch,
-                metadata={"strategy": "reflexion", "stage": "accepted_by_evaluator",
-                          "eval": eval_response or ""},
-            )
-
-        # ── Call 3: Reflector ────────────────────────────────────────────────
-        reflect_response = llm_client.chat(
-            [{"role": "system", "content": PATCH_SYSTEM},
-             {"role": "user",   "content": REFLECT_TEMPLATE.format(
-                 bug_id=bug_id, patch=initial_patch,
-                 eval_result=eval_response or "",
-                 memory_block=mem_block,
-             )}],
-            purpose="reflexion_reflector", attempt=attempt_index,
-            out_dir=out_dir, max_tokens=1500,
-        )
-
-        # Store reflection in memory buffer for future attempts
-        for line in (reflect_response or "").splitlines():
-            if line.lower().startswith("reflection:"):
-                self._memory.append(line.split(":", 1)[-1].strip())
-                break
-
-        revised_patch = extract_search_replace(reflect_response or "")
         return PatchResult(
-            diff_text=revised_patch or initial_patch,
-            metadata={"strategy": "reflexion", "stage": "reflected",
-                      "verdict": verdict, "memory": list(self._memory),
-                      "raw_reflect": reflect_response or ""},
+            diff_text=extract_search_replace(response or ""),
+            metadata={"strategy": "my_baseline"},
         )
 ```
 
-> **Runner note:** Because `ReflexionPatchGenerator` holds mutable state (`_memory`),
-> `runner.py` must instantiate it **once per bug**, not once globally.
-> The current `GENERATORS` dict stores classes; `run_bug()` calls `GENERATORS[baseline]()`
-> fresh for each bug — this is already correct.
-
----
-
-### 10c. `patch_generators/tot.py` — Tree of Thoughts
-
-**Paper:** Yao et al., NeurIPS 2023 oral (arXiv:2305.10601).
-
-**APR design:** Generate `N` candidate patches (branching), evaluate each for plausibility
-without running the compiler, then synthesise the single best patch. This is BFS at depth-1
-because the LLM budget is tight; depth can be increased by raising `n_branches`.
-
-```
-Call 1  →  generate N candidate patches in one response (branching)
-Call 2  →  evaluate each candidate: plausible / risky / incorrect
-Call 3  →  synthesise: given the evaluation, output the best patch
-```
-
-> **Key verified insight:** ToT's defining features are **state evaluation** and
-> **backtracking / pruning**, not just branching. The evaluator call implements the
-> state-evaluation step. Candidates scored `incorrect` are pruned before synthesis.
+2. Register in `config.py`:
 
 ```python
-# swe_agent/patch_generators/tot.py
-"""
-Tree of Thoughts patch generator.
-Paper: Yao et al., NeurIPS 2023 (arXiv:2305.10601)
-Strategy:
-  Call 1 — generate N candidate patches (branching).
-  Call 2 — evaluate each candidate (state evaluation / pruning).
-  Call 3 — synthesise best candidate into final patch (selection).
-Budget: 3 LLM calls per attempt.
-"""
-import re
-from pathlib import Path
-from .base import PatchGenerator, PatchResult
-from ._shared import (build_fail_context, build_location_context,
-                       extract_search_replace, PATCH_SYSTEM)
+BASELINES_PROMPTING = [..., "my_baseline"]
+```
 
+3. Register in `runner.py`:
 
-BRANCH_TEMPLATE = """{fail_context}
+```python
+from .patch_generators.my_baseline import MyBaselinePatchGenerator
 
-## Suspicious location(s)
-{location_context}
+GENERATORS = {
+    ...,
+    "my_baseline": MyBaselinePatchGenerator,
+}
+```
 
-## Task
-Generate {n_branches} distinct candidate patches for this bug.
-Each candidate must represent a different fix strategy.
+4. Run:
 
-For each candidate write:
-### Candidate N
-Strategy: <one sentence describing the approach>
-FILE: path/to/File.java
-SEARCH: <exact lines>
-REPLACE: <corrected lines>
-"""
-
-EVAL_TEMPLATE = """{fail_context}
-
-## Candidate patches to evaluate
-
-{candidates_text}
-
-For each candidate, rate it:
-  plausible   — logically fixes the root cause, low regression risk
-  risky       — might fix the symptom but could break other tests
-  incorrect   — wrong diagnosis or wrong code change
-
-Respond with one line per candidate:
-Candidate 1: <plausible|risky|incorrect> — <one-sentence reason>
-Candidate 2: <plausible|risky|incorrect> — <one-sentence reason>
-...
-"""
-
-SELECT_TEMPLATE = """{fail_context}
-
-## Candidate patches
-{candidates_text}
-
-## Evaluations
-{evaluations}
-
-Select the most plausible candidate (skip any rated incorrect).
-Output ONLY the selected patch:
-
-FILE: path/to/File.java
-SEARCH: <exact lines>
-REPLACE: <corrected lines>
-"""
-
-
-def _split_candidates(text: str) -> list[str]:
-    """Split a multi-candidate response by '### Candidate N' headers."""
-    parts = re.split(r"###\s*Candidate\s*\d+", text, flags=re.IGNORECASE)
-    return [p.strip() for p in parts if p.strip()]
-
-
-class ToTPatchGenerator(PatchGenerator):
-
-    def __init__(self, n_branches: int = 3):
-        self.n_branches = n_branches
-
-    def generate_patch(
-        self,
-        bug_id, workdir, failing_info, trigger_tests,
-        localization_hits, attempt_index, out_dir, llm_client,
-    ) -> PatchResult:
-
-        fail_ctx = build_fail_context(bug_id, trigger_tests, failing_info)
-        loc_ctx  = build_location_context(localization_hits, workdir)
-
-        # ── Call 1: Branching — generate N candidates ─────────────────────
-        branch_response = llm_client.chat(
-            [{"role": "system", "content": PATCH_SYSTEM},
-             {"role": "user", "content": BRANCH_TEMPLATE.format(
-                 fail_context=fail_ctx, location_context=loc_ctx,
-                 n_branches=self.n_branches,
-             )}],
-            purpose="tot_branch", attempt=attempt_index,
-            out_dir=out_dir, max_tokens=2000,
-        )
-
-        raw_candidates = _split_candidates(branch_response or "")
-        if not raw_candidates:
-            return PatchResult(diff_text="",
-                               metadata={"strategy": "tot", "stage": "no_candidates"})
-
-        candidates_text = "\n\n".join(
-            f"### Candidate {i+1}\n{c}" for i, c in enumerate(raw_candidates)
-        )
-
-        # ── Call 2: Evaluate — state evaluation / pruning ────────────────
-        eval_response = llm_client.chat(
-            [{"role": "user", "content": EVAL_TEMPLATE.format(
-                fail_context=fail_ctx, candidates_text=candidates_text,
-            )}],
-            purpose="tot_evaluate", attempt=attempt_index,
-            out_dir=out_dir, max_tokens=500,
-        )
-
-        # ── Call 3: Select — synthesise the best surviving path ───────────
-        select_response = llm_client.chat(
-            [{"role": "system", "content": PATCH_SYSTEM},
-             {"role": "user", "content": SELECT_TEMPLATE.format(
-                 fail_context=fail_ctx,
-                 candidates_text=candidates_text,
-                 evaluations=eval_response or "",
-             )}],
-            purpose="tot_select", attempt=attempt_index,
-            out_dir=out_dir, max_tokens=1200,
-        )
-
-        diff = extract_search_replace(select_response or "")
-        return PatchResult(
-            diff_text=diff,
-            metadata={
-                "strategy":    "tot",
-                "n_branches":  self.n_branches,
-                "evaluations": eval_response or "",
-                "raw_select":  select_response or "",
-            },
-        )
+```bash
+python -m swe_agent.runner \
+  --project Lang --bug 1 --baseline my_baseline --out outputs
 ```
 
 ---
 
-### 10d. `patch_generators/self_consistency.py` — Self-Consistency
+## 12. Claude Code guidance
 
-**Paper:** Wang et al., ICLR 2023 (arXiv:2203.11171).
-
-**APR design:** Generate `N` independent patches using different CoT phrasings, then ask
-the model to act as a meta-judge and pick the most consistent fix. Wang et al. showed
-+17.9% on GSM8K over standard CoT using majority vote — here we use an LLM judge
-instead of exact-string majority vote because patch diffs are not easily deduplicated.
+This repository ships with a `.claude/` folder for Claude Code:
 
 ```
-Calls 1…N  →  N independent CoT patch generations (different prompts)
-Call  N+1  →  meta-judge picks the most consistent patch
+.claude/
+├── guidance.md   ← full implementation spec for all 15 baselines
+│                   (sections 0-16, implementation order, key invariants)
+└── tutorial.md   ← prompting baselines tutorial with verified paper citations
+                    and full PoC code for all 10 prompting strategies
 ```
 
-```python
-# swe_agent/patch_generators/self_consistency.py
-"""
-Self-Consistency patch generator.
-Paper: Wang et al., ICLR 2023 (arXiv:2203.11171)
-Strategy:
-  Calls 1..N — N independent CoT patch generations.
-  Call N+1   — LLM judge selects the most consistent patch.
-Budget: N+1 LLM calls per attempt (default N=3 to stay within budget).
-Note: N is capped at MAX_LLM_CALLS_PER_ATTEMPT - 1.
-"""
-from pathlib import Path
-from .base import PatchGenerator, PatchResult
-from ._shared import (build_fail_context, build_location_context,
-                       extract_search_replace, PATCH_SYSTEM)
-from ...config import MAX_LLM_CALLS_PER_ATTEMPT
+When using Claude Code to implement or extend this project:
 
-
-# Different CoT phrasings — each elicits a slightly different reasoning path
-PHRASINGS = [
-    "Reason step by step about the root cause, then output the patch.",
-    "Think carefully about what the stack trace tells you, then output the patch.",
-    "Identify the minimal code change that fixes the failing test, then output the patch.",
-    "Trace the execution path from the test to the bug, then output the patch.",
-    "Consider what invariant the buggy code violates, then output the patch.",
-]
-
-BASE_TEMPLATE = """{fail_context}
-
-## Suspicious location(s)
-{location_context}
-
-{phrasing}
-
-FILE: path/to/File.java
-SEARCH: <exact lines>
-REPLACE: <corrected lines>
-"""
-
-JUDGE_TEMPLATE = """{fail_context}
-
-## {n} independently generated candidate patches
-
-{candidates_text}
-
-These patches were generated with different reasoning approaches for the same bug.
-Select the patch that is most likely to be correct.
-Prefer the patch that:
-  1. Targets the actual root cause (not just a symptom)
-  2. Makes the minimal necessary change
-  3. Is consistent with multiple other candidates
-
-Output ONLY the selected patch (no commentary):
-
-FILE: path/to/File.java
-SEARCH: <exact lines>
-REPLACE: <corrected lines>
-"""
-
-
-class SelfConsistencyPatchGenerator(PatchGenerator):
-
-    def __init__(self, n_samples: int = 3):
-        # cap at budget - 1 to leave room for the judge call
-        self.n_samples = min(n_samples, MAX_LLM_CALLS_PER_ATTEMPT - 1)
-
-    def generate_patch(
-        self,
-        bug_id, workdir, failing_info, trigger_tests,
-        localization_hits, attempt_index, out_dir, llm_client,
-    ) -> PatchResult:
-
-        fail_ctx = build_fail_context(bug_id, trigger_tests, failing_info)
-        loc_ctx  = build_location_context(localization_hits, workdir)
-
-        # ── Calls 1…N: independent patch samples ─────────────────────────
-        patches = []
-        raws    = []
-        for i in range(self.n_samples):
-            phrasing = PHRASINGS[i % len(PHRASINGS)]
-            prompt   = BASE_TEMPLATE.format(
-                fail_context=fail_ctx, location_context=loc_ctx,
-                phrasing=phrasing,
-            )
-            raw = llm_client.chat(
-                [{"role": "system", "content": PATCH_SYSTEM},
-                 {"role": "user",   "content": prompt}],
-                purpose=f"sc_sample_{i+1}", attempt=attempt_index,
-                out_dir=out_dir, max_tokens=1200,
-            )
-            raws.append(raw or "")
-            p = extract_search_replace(raw or "")
-            if p:
-                patches.append(p)
-
-        if not patches:
-            return PatchResult(diff_text="",
-                               metadata={"strategy": "self_consistency",
-                                         "stage": "no_patches_extracted"})
-
-        # If only one unique patch, return it directly
-        if len(set(patches)) == 1:
-            return PatchResult(
-                diff_text=patches[0],
-                metadata={"strategy": "self_consistency", "n_samples": self.n_samples,
-                          "unanimous": True},
-            )
-
-        # ── Call N+1: meta-judge ──────────────────────────────────────────
-        candidates_text = "\n\n".join(
-            f"### Candidate {i+1}\n{p}" for i, p in enumerate(patches)
-        )
-        judge_response = llm_client.chat(
-            [{"role": "system", "content": PATCH_SYSTEM},
-             {"role": "user",   "content": JUDGE_TEMPLATE.format(
-                 fail_context=fail_ctx, n=len(patches),
-                 candidates_text=candidates_text,
-             )}],
-            purpose="sc_judge", attempt=attempt_index,
-            out_dir=out_dir, max_tokens=1200,
-        )
-
-        final_patch = extract_search_replace(judge_response or "") or patches[0]
-        return PatchResult(
-            diff_text=final_patch,
-            metadata={
-                "strategy":    "self_consistency",
-                "n_samples":   self.n_samples,
-                "n_patches":   len(patches),
-                "raw_samples": raws,
-                "raw_judge":   judge_response or "",
-            },
-        )
-```
+- **Read `.claude/guidance.md` first.** It contains the complete module-by-module
+  contract and a strict implementation order (steps 1–31) to avoid import errors.
+- **Read `.claude/tutorial.md` for any prompting baseline.** It contains the full
+  OOP implementation with design principles, paper citations, and working PoC code.
+- Implement modules in the order specified in `guidance.md` Section 13.
+- All new baselines must use `_shared.py` — never duplicate `PATCH_SYSTEM` or
+  `extract_search_replace`.
 
 ---
 
-### 10e. `patch_generators/got.py` — Graph of Thoughts
+## 13. References
 
-**Paper:** Besta et al., AAAI 2024 (arXiv:2308.09687).
-
-**APR design:** Represent repair reasoning as a directed graph with three node types.
-`Generation` nodes branch from the root (multiple fix hypotheses). `Refinement` nodes
-self-loop to improve a hypothesis. `Aggregation` nodes merge two hypotheses into one
-combined patch — this is the key novelty that cannot be represented in a tree.
-The graph is stored in Python and its summary is injected into the synthesis prompt.
-
-```
-Call 1  →  seed: high-level root-cause analysis
-Call 2  →  Generation: hypothesis A (approach 1)
-Call 3  →  Generation: hypothesis B (approach 2)
-Call 4  →  Aggregation: merge A + B into a combined patch node
-Call 5  →  Synthesis: given full graph, output final patch
-```
-
-> **Critical lesson from the tutorial:** the synthesis call must receive the
-> **full graph summary** — not just the original question. Passing only the bug context
-> discards all graph reasoning.
-
-```python
-# swe_agent/patch_generators/got.py
-"""
-Graph of Thoughts patch generator.
-Paper: Besta et al., AAAI 2024 (arXiv:2308.09687)
-Strategy:
-  Call 1 — seed node: root-cause analysis.
-  Call 2 — Generation node: fix hypothesis A.
-  Call 3 — Generation node: fix hypothesis B.
-  Call 4 — Aggregation node: merge A + B (the GoT novelty vs ToT).
-  Call 5 — Synthesis: produce final patch from full graph.
-Budget: 5 LLM calls per attempt.
-"""
-from dataclasses import dataclass, field
-from pathlib import Path
-from .base import PatchGenerator, PatchResult
-from ._shared import (build_fail_context, build_location_context,
-                       extract_search_replace, PATCH_SYSTEM)
-
-
-# ── Graph data structure ──────────────────────────────────────────────────────
-
-@dataclass
-class GoTGraph:
-    nodes: dict  = field(default_factory=dict)   # id → text
-    edges: list  = field(default_factory=list)   # (src, dst, relation)
-    _ctr:  int   = field(default=1, repr=False)
-
-    def add(self, text: str, label: str = "") -> str:
-        nid = f"N{self._ctr}"
-        self._ctr += 1
-        self.nodes[nid] = f"[{label}] {text}" if label else text
-        return nid
-
-    def connect(self, src: str, dst: str, rel: str):
-        self.edges.append((src, dst, rel))
-
-    def summary(self) -> str:
-        node_lines = "\n".join(
-            f"  {nid}: {txt[:200]}" for nid, txt in self.nodes.items()
-        )
-        edge_lines = "\n".join(
-            f"  {s} --[{r}]--> {d}" for s, d, r in self.edges
-        )
-        return f"Nodes:\n{node_lines}\n\nEdges:\n{edge_lines}"
-
-
-# ── Prompt templates ──────────────────────────────────────────────────────────
-
-SEED_TEMPLATE = """{fail_context}
-
-## Suspicious location(s)
-{location_context}
-
-Analyse the root cause of this bug. Do NOT write a patch yet.
-Describe: what is wrong, why it causes the test to fail, which lines are buggy.
-"""
-
-GENERATE_TEMPLATE = """Task: fix bug {bug_id}.
-
-Root cause analysis:
-{seed_text}
-
-Generate a {approach_label} fix strategy and the corresponding patch.
-
-Strategy: <one sentence>
-FILE: path/to/File.java
-SEARCH: <exact lines>
-REPLACE: <corrected lines>
-"""
-
-AGGREGATE_TEMPLATE = """Task: fix bug {bug_id}.
-
-Root cause:
-{seed_text}
-
-Fix hypothesis A ({nid_a}):
-{text_a}
-
-Fix hypothesis B ({nid_b}):
-{text_b}
-
-Merge the strongest elements of A and B into a single improved patch.
-Take the best diagnosis from each, resolve any contradictions, and output:
-
-FILE: path/to/File.java
-SEARCH: <exact lines>
-REPLACE: <corrected lines>
-"""
-
-SYNTHESIS_TEMPLATE = """Task: fix bug {bug_id}.
-
-{fail_context}
-
-## Full reasoning graph
-
-{graph_summary}
-
-Review the graph. Select the reasoning path that best explains the root cause,
-then output the final patch.
-
-FILE: path/to/File.java
-SEARCH: <exact lines>
-REPLACE: <corrected lines>
-"""
-
-
-class GoTPatchGenerator(PatchGenerator):
-
-    def generate_patch(
-        self,
-        bug_id, workdir, failing_info, trigger_tests,
-        localization_hits, attempt_index, out_dir, llm_client,
-    ) -> PatchResult:
-
-        fail_ctx = build_fail_context(bug_id, trigger_tests, failing_info)
-        loc_ctx  = build_location_context(localization_hits, workdir)
-        g = GoTGraph()
-
-        # ── Call 1: Seed — root-cause analysis ────────────────────────────
-        seed_raw = llm_client.chat(
-            [{"role": "user", "content": SEED_TEMPLATE.format(
-                fail_context=fail_ctx, location_context=loc_ctx,
-            )}],
-            purpose="got_seed", attempt=attempt_index,
-            out_dir=out_dir, max_tokens=600,
-        )
-        n_seed = g.add(seed_raw or "", label="root-cause")
-
-        # ── Calls 2-3: Generation — two distinct fix hypotheses ───────────
-        hypothesis_nodes = []
-        for approach in ("conservative minimal fix", "alternative deeper fix"):
-            hyp_raw = llm_client.chat(
-                [{"role": "system", "content": PATCH_SYSTEM},
-                 {"role": "user",   "content": GENERATE_TEMPLATE.format(
-                     bug_id=bug_id, seed_text=seed_raw or "",
-                     approach_label=approach,
-                 )}],
-                purpose=f"got_generate_{approach.split()[0]}", attempt=attempt_index,
-                out_dir=out_dir, max_tokens=1000,
-            )
-            n_hyp = g.add(hyp_raw or "", label=f"gen:{approach}")
-            g.connect(n_seed, n_hyp, "generation")
-            hypothesis_nodes.append(n_hyp)
-
-        # ── Call 4: Aggregation — merge hypotheses (GoT novelty) ──────────
-        if len(hypothesis_nodes) == 2:
-            nid_a, nid_b = hypothesis_nodes
-            agg_raw = llm_client.chat(
-                [{"role": "system", "content": PATCH_SYSTEM},
-                 {"role": "user",   "content": AGGREGATE_TEMPLATE.format(
-                     bug_id=bug_id,
-                     seed_text=seed_raw or "",
-                     nid_a=nid_a, text_a=g.nodes[nid_a],
-                     nid_b=nid_b, text_b=g.nodes[nid_b],
-                 )}],
-                purpose="got_aggregate", attempt=attempt_index,
-                out_dir=out_dir, max_tokens=1200,
-            )
-            n_agg = g.add(agg_raw or "", label="aggregation")
-            g.connect(nid_a, n_agg, "aggregation")
-            g.connect(nid_b, n_agg, "aggregation")
-
-        # ── Call 5: Synthesis — final patch from full graph ───────────────
-        # CRITICAL: pass graph summary, not just fail_ctx
-        synth_raw = llm_client.chat(
-            [{"role": "system", "content": PATCH_SYSTEM},
-             {"role": "user",   "content": SYNTHESIS_TEMPLATE.format(
-                 bug_id=bug_id,
-                 fail_context=fail_ctx,
-                 graph_summary=g.summary(),
-             )}],
-            purpose="got_synthesis", attempt=attempt_index,
-            out_dir=out_dir, max_tokens=1200,
-        )
-
-        diff = extract_search_replace(synth_raw or "")
-        return PatchResult(
-            diff_text=diff,
-            metadata={
-                "strategy":     "got",
-                "graph_nodes":  len(g.nodes),
-                "graph_edges":  len(g.edges),
-                "graph_summary": g.summary(),
-                "raw_synth":    synth_raw or "",
-            },
-        )
-```
+| Paper | Authors | Venue | arXiv |
+|---|---|---|---|
+| Chain-of-Thought Prompting Elicits Reasoning in LLMs | Wei et al. | NeurIPS 2022 | 2201.11903 |
+| Large Language Models are Zero-Shot Reasoners | Kojima et al. | NeurIPS 2022 | 2205.11916 |
+| Self-Consistency Improves CoT Reasoning in LMs | Wang et al. | ICLR 2023 | 2203.11171 |
+| ReAct: Synergizing Reasoning and Acting in LMs | Yao et al. | ICLR 2023 | 2210.03629 |
+| Reflexion: Language Agents with Verbal RL | Shinn et al. | NeurIPS 2023 | 2303.11366 |
+| Tree of Thoughts: Deliberate Problem Solving with LLMs | Yao et al. | NeurIPS 2023 | 2305.10601 |
+| Program of Thoughts Prompting | Chen et al. | TMLR 2023 | 2211.12588 |
+| PAL: Program-aided Language Models | Gao et al. | ICML 2023 | 2211.10435 |
+| Toolformer: LMs Can Teach Themselves to Use Tools | Schick et al. | NeurIPS 2023 | 2302.04761 |
+| Graph of Thoughts: Solving Elaborate Problems with LLMs | Besta et al. | AAAI 2024 | 2308.09687 |
+| Defects4J: A Database of Existing Faults to Enable Studies | Just et al. | ISSTA 2014 | — |
+| The Prompt Report: A Systematic Survey of PE Techniques | Schulhoff et al. | 2024 | 2406.06608 |
 
