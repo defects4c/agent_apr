@@ -1,0 +1,12 @@
+[submodule "Agentless"]
+	path = Agentless
+	url = https://github.com/OpenAutoCoder/Agentless.git
+[submodule "HyperAgent"]
+	path = HyperAgent
+	url = https://github.com/FSoft-AI4Code/HyperAgent.git
+[submodule "RepairAgent"]
+	path = RepairAgent
+	url = https://github.com/sola-st/RepairAgent
+[submodule "SWE-agent"]
+	path = SWE-agent
+	url = https://github.com/SWE-agent/SWE-agent
