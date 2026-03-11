@@ -8,7 +8,7 @@ import os
 import time
 from pathlib import Path
 from . import config, defects4j as d4j, reason
-from .llm_client import LLMClient, BudgetExceededError
+from .llm_client import LLMClient, BudgetExceededError, Colors, colorize
 from .budget import BudgetManager
 from .trace import TraceWriter
 from .localize import localize
@@ -53,15 +53,78 @@ GENERATORS = {
     "function_calling": FunctionCallingPatchGenerator,
 }
 
+# Global verbose flags
+_VERBOSE_LLM = False
+_VERBOSE_PATCH = False
 
-def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path) -> dict:
+
+def set_verbose_flags(llm_verbose: bool = False, patch_verbose: bool = False):
+    """Set global verbose flags for LLM and patch output."""
+    global _VERBOSE_LLM, _VERBOSE_PATCH
+    _VERBOSE_LLM = llm_verbose
+    _VERBOSE_PATCH = patch_verbose
+
+
+def _print_patch_diff(diff_text: str, status: str):
+    """Print patch diff with syntax highlighting."""
+    if not _VERBOSE_PATCH:
+        return
+
+    print("\n" + "=" * 70)
+    status_color = Colors.GREEN if status == "OK" else Colors.RED
+    print(colorize(f" [PATCH DIFF] - Status: {status}", Colors.BOLD + status_color))
+    print("=" * 70)
+
+    for line in diff_text.splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            print(colorize(line, Colors.BOLD + Colors.CYAN))
+        elif line.startswith("+"):
+            print(colorize(line, Colors.GREEN))
+        elif line.startswith("-"):
+            print(colorize(line, Colors.RED))
+        elif line.startswith("@@"):
+            print(colorize(line, Colors.YELLOW))
+        elif line.startswith("diff --git"):
+            print(colorize(line, Colors.BOLD + Colors.MAGENTA))
+        else:
+            print(colorize(line, Colors.GRAY))
+    print("=" * 70)
+
+
+def _print_verification_status(phase: str, status: str, details: str = ""):
+    """Print verification step status with colors."""
+    if not _VERBOSE_PATCH:
+        return
+
+    status_icons = {
+        "OK": colorize("✓", Colors.GREEN),
+        "PASS": colorize("✓", Colors.GREEN),
+        "FAIL": colorize("✗", Colors.RED),
+        "ERROR": colorize("✗", Colors.RED),
+    }
+    phase_colors = {
+        "apply_patch": Colors.BLUE,
+        "compile": Colors.MAGENTA,
+        "func_test": Colors.CYAN,
+        "reg_test": Colors.YELLOW,
+    }
+
+    icon = status_icons.get(status, "?")
+    color = phase_colors.get(phase, Colors.WHITE)
+    print(f"  {icon} {colorize(f'{phase}: {status}', color)}")
+    if details:
+        print(colorize(f"    → {details[:100]}", Colors.DIM))
+
+
+def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path,
+            llm_verbose: bool = False, patch_verbose: bool = False) -> dict:
     bug_name = f"{project}_{bug_id}"
     workdir = Path(config.REPOS_DIR) / f"{project}-{bug_id}"
     out_dir = out_dir / baseline
     out_dir.mkdir(parents=True, exist_ok=True)
 
     trace = TraceWriter(out_dir / "trace.jsonl")
-    llm = LLMClient(baseline, bug_name)
+    llm = LLMClient(baseline, bug_name, verbose=llm_verbose)
     budget = BudgetManager()
     gen = GENERATORS[baseline]()
 
@@ -72,23 +135,42 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path) -> dict:
         "attempt_summaries": [],
     }
 
+    # ── Verbose header ──────────────────────────────────────────────────────
+    if patch_verbose:
+        print("\n" + "=" * 70)
+        print(colorize(f" [REPAIR RUN] Bug: {bug_name} | Baseline: {baseline}", Colors.BOLD + Colors.CYAN))
+        print("=" * 70)
+
     # ── 1. Checkout ──────────────────────────────────────────────────────────
+    if patch_verbose:
+        print(colorize("\n[1/6] Checking out buggy version...", Colors.DIM))
     try:
         d4j.checkout(project, bug_id, "b", workdir,
                      log_path=out_dir / "logs" / "checkout.log")
+        if patch_verbose:
+            _print_verification_status("checkout", "OK")
     except Exception as e:
         result["status"] = "error"
         result["notes"] = str(e)
+        if patch_verbose:
+            _print_verification_status("checkout", "ERROR", str(e)[:100])
         _write_result(result, out_dir)
         return result
 
     # ── 2. Pre-patch baseline ────────────────────────────────────────────────
+    if patch_verbose:
+        print(colorize("\n[2/6] Running pre-patch tests...", Colors.DIM))
     n_before, failing_before, _ = d4j.test(
         workdir, project, log_path=out_dir / "logs" / "test_before.log")
     if n_before == 0:
         result["notes"] = "already passing"
+        if patch_verbose:
+            print(colorize("\n → Tests already passing, skipping repair", Colors.GREEN))
         _write_result(result, out_dir)
         return result
+
+    if patch_verbose:
+        print(colorize(f" → {n_before} failing test(s) detected", Colors.YELLOW))
 
     result["failing_count_before"] = n_before
     result["failing_tests_before"] = failing_before
@@ -121,12 +203,18 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path) -> dict:
     bug_info_dir = os.path.join(config.D4J_FOLDER, bug_name)
     loc_hits = localize(workdir, project, test_log, bug_info_dir)
 
+    if patch_verbose and loc_hits:
+        print(colorize(f" → Localization: {len(loc_hits)} suspicious location(s)", Colors.CYAN))
+
     # ── 3. Attempt loop ───────────────────────────────────────────────────────
     v_time = {"apply_patch": 0.0, "compile": 0.0, "func_test": 0.0, "reg_test": 0.0}
 
     for attempt in range(1, config.MAX_ATTEMPTS_PER_BUG + 1):
         result["attempts_used"] = attempt
         attempt_status = {}
+
+        if patch_verbose:
+            print(colorize(f"\n[ATTEMPT {attempt}/{config.MAX_ATTEMPTS_PER_BUG}]", Colors.BOLD + Colors.YELLOW))
 
         # a) Generate patch
         try:
@@ -139,6 +227,8 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path) -> dict:
                 "phase": "patch_gen", "status": "FAIL",
                 "reason_code": reason.TIMEOUT, "reason": str(e)
             })
+            if patch_verbose:
+                print(colorize(f" → Budget exceeded: {e}", Colors.RED))
             break
 
         _save_attempt(patch_result, attempt, out_dir)
@@ -149,10 +239,16 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path) -> dict:
                 "reason_code": "EMPTY_DIFF"
             }
             result["attempt_summaries"].append(attempt_status)
+            if patch_verbose:
+                print(colorize(" → No patch generated (EMPTY_DIFF)", Colors.RED))
             # Provide feedback to reflexion
             if baseline == "reflexion" and hasattr(gen, "update_feedback"):
                 gen.update_feedback("empty_patch", "No patch was generated. Try a different approach.")
             continue
+
+        # Show patch diff if verbose
+        if patch_verbose:
+            _print_patch_diff(patch_result.diff_text, "GENERATED")
 
         # b) Budget / safety check
         try:
@@ -166,6 +262,8 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path) -> dict:
                 "reason_code": rc
             }
             result["attempt_summaries"].append(attempt_status)
+            if patch_verbose:
+                _print_verification_status("budget_check", "FAIL", str(e)[:80])
             continue
 
         # c) Apply patch
@@ -181,11 +279,16 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path) -> dict:
                 "reason_code": rc
             }
             result["attempt_summaries"].append(attempt_status)
+            if patch_verbose:
+                _print_verification_status("apply_patch", "FAIL", err[:80])
             # Provide feedback to reflexion
             if baseline == "reflexion" and hasattr(gen, "update_feedback"):
                 gen.update_feedback("patch_apply_failed", f"Patch failed to apply: {err[:200]}")
             rollback(workdir)
             continue
+        else:
+            if patch_verbose:
+                _print_verification_status("apply_patch", "OK")
 
         # d) Compile
         t0 = time.monotonic()
@@ -203,11 +306,16 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path) -> dict:
                 "reason_code": rc
             }
             result["attempt_summaries"].append(attempt_status)
+            if patch_verbose:
+                _print_verification_status("compile", "FAIL", rc)
             # Provide feedback to reflexion
             if baseline == "reflexion" and hasattr(gen, "update_feedback"):
                 gen.update_feedback("build_failed", f"Compilation failed: {build_log[:200]}")
             rollback(workdir)
             continue
+        else:
+            if patch_verbose:
+                _print_verification_status("compile", "OK")
 
         # e) Functionality gate
         t0 = time.monotonic()
@@ -228,11 +336,16 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path) -> dict:
                 "reason_code": rc
             }
             result["attempt_summaries"].append(attempt_status)
+            if patch_verbose:
+                _print_verification_status("func_test", "FAIL", f"{n_func} test(s) failing")
             # Provide feedback to reflexion
             if baseline == "reflexion" and hasattr(gen, "update_feedback"):
                 gen.update_feedback("functionality_failed", f"Trigger tests still failing: {still_failing[:3]}")
             rollback(workdir)
             continue
+        else:
+            if patch_verbose:
+                _print_verification_status("func_test", "PASS")
 
         # f) Regression gate
         t0 = time.monotonic()
@@ -254,11 +367,16 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path) -> dict:
                 "reason_code": rc
             }
             result["attempt_summaries"].append(attempt_status)
+            if patch_verbose:
+                _print_verification_status("reg_test", "FAIL", f"{len(new_failures)} new failure(s)")
             # Provide feedback to reflexion
             if baseline == "reflexion" and hasattr(gen, "update_feedback"):
                 gen.update_feedback("regression_failed", f"New test failures: {list(new_failures)[:3]}")
             rollback(workdir)
             continue
+        else:
+            if patch_verbose:
+                _print_verification_status("reg_test", "PASS")
 
         # g) REPAIRED ✓
         (out_dir / "patch.diff").write_text(patch_result.diff_text)
@@ -267,6 +385,10 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path) -> dict:
         result["failing_count_after"] = 0
         attempt_status = {"attempt": attempt, "status": reason.REPAIRED}
         result["attempt_summaries"].append(attempt_status)
+
+        if patch_verbose:
+            print(colorize("\n✓ REPAIR SUCCESSFUL!", Colors.BOLD + Colors.GREEN))
+            _print_patch_diff(patch_result.diff_text, "FINAL")
         break
 
     # ── 4. Finalize result.json ───────────────────────────────────────────────
@@ -353,9 +475,18 @@ def main():
     p.add_argument("--baseline", default="agentless",
                    choices=list(GENERATORS.keys()))
     p.add_argument("--out", default="outputs")
+    p.add_argument("--llm_verbose", action="store_true",
+                   help="Show LLM prompts and responses with colors")
+    p.add_argument("--patch_verbose", action="store_true",
+                   help="Show patch diffs and verification status with colors")
     args = p.parse_args()
+
+    # Set verbose flags
+    set_verbose_flags(args.llm_verbose, args.patch_verbose)
+
     result = run_bug(args.project, args.bug, args.baseline,
-                     Path(args.out) / f"{args.project}-{args.bug}")
+                     Path(args.out) / f"{args.project}-{args.bug}",
+                     llm_verbose=args.llm_verbose, patch_verbose=args.patch_verbose)
     print(json.dumps(result, indent=2))
 
 

@@ -590,3 +590,16 @@ When using Claude Code to implement or extend this project:
 | Defects4J: A Database of Existing Faults to Enable Studies | Just et al. | ISSTA 2014 | — |
 | The Prompt Report: A Systematic Survey of PE Techniques | Schulhoff et al. | 2024 | 2406.06608 |
 
+
+[submodule "Agentless"]
+        path = Agentless
+        url = https://github.com/OpenAutoCoder/Agentless.git
+[submodule "HyperAgent"]
+        path = HyperAgent
+        url = https://github.com/FSoft-AI4Code/HyperAgent.git
+[submodule "RepairAgent"]
+        path = RepairAgent
+        url = https://github.com/sola-st/RepairAgent
+[submodule "SWE-agent"]
+        path = SWE-agent
+        url = https://github.com/SWE-agent/SWE-agent

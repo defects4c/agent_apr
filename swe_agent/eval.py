@@ -9,7 +9,8 @@ import json
 import csv
 from pathlib import Path
 from datetime import date
-from .runner import run_bug, GENERATORS
+from .runner import run_bug, GENERATORS, set_verbose_flags
+from .llm_client import Colors, colorize
 
 
 def load_bug_list(path: str) -> list[tuple[str, str]]:
@@ -31,18 +32,40 @@ def main():
     p.add_argument("--baseline", nargs="+", default=["agentless"],
                    choices=list(GENERATORS.keys()))
     p.add_argument("--out", default="outputs")
+    p.add_argument("--llm_verbose", action="store_true",
+                   help="Show LLM prompts and responses with colors")
+    p.add_argument("--patch_verbose", action="store_true",
+                   help="Show patch diffs and verification status with colors")
     args = p.parse_args()
+
+    # Set global verbose flags
+    set_verbose_flags(args.llm_verbose, args.patch_verbose)
 
     bugs = load_bug_list(args.bugs)
     out_dir = Path(args.out)
     all_results: list[dict] = []
 
+    # Print header if verbose
+    if args.llm_verbose or args.patch_verbose:
+        print(colorize("\n" + "=" * 70, Colors.BOLD + Colors.CYAN))
+        print(colorize(" [Defects4J Agent-Based APR Evaluation]", Colors.BOLD + Colors.CYAN))
+        print(colorize("=" * 70, Colors.CYAN))
+        print(colorize(f"  Bugs: {len(bugs)} | Baselines: {len(args.baseline)}", Colors.DIM))
+        print(colorize("=" * 70, Colors.CYAN) + "\n")
+
     for project, bug_id in bugs:
         for baseline in args.baseline:
             bug_out = out_dir / f"{project}-{bug_id}"
-            print(f"  [{baseline}] {project}-{bug_id} ...", end=" ", flush=True)
+
+            if args.llm_verbose or args.patch_verbose:
+                print(colorize(f"\n[{baseline}] {project}-{bug_id}", Colors.BOLD + Colors.MAGENTA))
+                print(colorize("-" * 50, Colors.DIM))
+            else:
+                print(f"  [{baseline}] {project}-{bug_id} ...", end=" ", flush=True)
+
             try:
-                result = run_bug(project, bug_id, baseline, bug_out)
+                result = run_bug(project, bug_id, baseline, bug_out,
+                                 llm_verbose=args.llm_verbose, patch_verbose=args.patch_verbose)
             except Exception as e:
                 result = {
                     "bug": f"{project}_{bug_id}",
@@ -52,7 +75,13 @@ def main():
                 }
                 (bug_out / baseline).mkdir(parents=True, exist_ok=True)
                 (bug_out / baseline / "result.json").write_text(json.dumps(result, indent=2))
-            print(result["status"])
+
+            if args.llm_verbose or args.patch_verbose:
+                status_color = Colors.GREEN if result["status"] == "repaired" else Colors.RED if result["status"] == "error" else Colors.YELLOW
+                print(colorize(f"→ Result: {result['status']}", status_color))
+            else:
+                print(result["status"])
+
             all_results.append(result)
 
     _write_summary(all_results, out_dir)
