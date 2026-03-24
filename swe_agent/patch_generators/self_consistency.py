@@ -2,16 +2,20 @@
 """
 Self-Consistency patch generator.
 Paper: Wang et al. (ICLR 2023)
-Strategy: Generate multiple independent samples, select the most common answer.
-Budget: n_samples + 1 calls per attempt (samples + aggregator/judge).
+Strategy: Generate N independent samples with temperature>0, select most common.
+Budget: n_samples + 1 calls per attempt (samples + aggregator).
+
+CRITICAL: temperature MUST be >0 (e.g. 0.7) for diverse samples.
+With temperature=0 all N samples are identical, defeating the purpose.
 """
 from pathlib import Path
 from collections import Counter
 from .base import PatchGenerator, PatchResult
-from ._shared import (build_fail_context, build_location_context, PATCH_SYSTEM, extract_search_replace)
-from .agentless import apply_search_replace_directly, search_replace_to_diff
+from ._shared import (build_fail_context, build_location_context, PATCH_SYSTEM,
+                       extract_search_replace)
 from ..config import MAX_LLM_CALLS_PER_ATTEMPT
 
+SAMPLE_TEMPERATURE = 0.7  # Wang et al. use 0.5-0.7
 
 SAMPLE_SYSTEM = """You are fixing a Java bug. Analyze the failing test and stack trace.
 Output a minimal fix using this format:
@@ -51,9 +55,6 @@ AGGREGATE_USER = """## Bug: {bug_id}
 
 ## Task
 Based on the samples above, identify the most consistent fix pattern.
-If samples agree on the location and type of fix, output that fix.
-If samples disagree significantly, choose the most common pattern.
-
 Output the final patch:
 """
 
@@ -61,7 +62,7 @@ Output the final patch:
 class SelfConsistencyPatchGenerator(PatchGenerator):
 
     def __init__(self):
-        self.n_samples = 3  # Number of independent samples
+        self.n_samples = 3
 
     def generate_patch(
         self,
@@ -71,130 +72,57 @@ class SelfConsistencyPatchGenerator(PatchGenerator):
 
         fail_ctx = build_fail_context(bug_id, trigger_tests, failing_info)
         loc_ctx = build_location_context(localization_hits, workdir)
-
-        # Limit samples based on budget
         n_samples = min(self.n_samples, MAX_LLM_CALLS_PER_ATTEMPT - 1)
 
         samples = []
-
-        # Generate multiple independent samples
         for i in range(n_samples):
-            prompt = SAMPLE_USER.format(
-                bug_id=bug_id,
-                fail_context=fail_ctx,
-                location_context=loc_ctx,
-            )
-
-            messages = [
-                {"role": "system", "content": SAMPLE_SYSTEM},
-                {"role": "user", "content": prompt}
-            ]
-
             response = llm_client.chat(
-                messages, purpose=f"self_consistency_sample_{i+1}",
-                attempt=attempt_index, out_dir=out_dir, max_tokens=1000
+                [{"role": "system", "content": SAMPLE_SYSTEM},
+                 {"role": "user", "content": SAMPLE_USER.format(
+                     bug_id=bug_id, fail_context=fail_ctx, location_context=loc_ctx)}],
+                purpose=f"sc_sample_{i+1}", attempt=attempt_index,
+                out_dir=out_dir, max_tokens=1200,
+                temperature=SAMPLE_TEMPERATURE,  # CRITICAL: diverse sampling
             )
-
             if response:
                 samples.append(response)
 
         if not samples:
             return PatchResult(diff_text="", metadata={
-                "strategy": "self_consistency", "samples": 0, "reason": "no samples"
-            })
+                "strategy": "self_consistency", "reason": "no_samples"})
 
-        # Try to extract file locations and find consensus
-        file_counter = Counter()
-        for sample in samples:
-            import re
-            match = re.search(r'FILE:\s*(\S+)', sample)
-            if match:
-                file_counter[match.group(1)] += 1
-
-        # Find most common file
-        if file_counter:
-            most_common_file, count = file_counter.most_common(1)[0]
-            consensus_ratio = count / len(samples)
-        else:
-            most_common_file = ""
-            consensus_ratio = 0
-
-        # Aggregate samples
-        samples_text = "\n\n".join(
-            f"### Sample {i+1}\n{s}" for i, s in enumerate(samples)
-        )
-
-        agg_prompt = AGGREGATE_USER.format(
-            bug_id=bug_id,
-            n_samples=len(samples),
-            samples=samples_text,
-        )
-
-        messages = [
-            {"role": "system", "content": AGGREGATE_SYSTEM},
-            {"role": "user", "content": agg_prompt}
-        ]
-
-        agg_response = llm_client.chat(
-            messages, purpose="self_consistency_aggregate",
-            attempt=attempt_index, out_dir=out_dir, max_tokens=1500
-        )
-
-        if not agg_response:
-            return PatchResult(diff_text="", metadata={
-                "strategy": "self_consistency",
-                "n_samples": len(samples),
-                "consensus_file": most_common_file,
-                "consensus_ratio": round(consensus_ratio, 2),
-                "reason": "no_aggregate_response"
-            })
-
-        # Strategy 1: Try to apply aggregated result directly
-        success, result = apply_search_replace_directly(agg_response, workdir)
-        if success:
-            from ..apply_patch import rollback
-            rollback(workdir)
-            return PatchResult(diff_text=result, metadata={
-                "strategy": "self_consistency",
-                "n_samples": len(samples),
-                "consensus_file": most_common_file,
-                "consensus_ratio": round(consensus_ratio, 2),
-                "aggregate_response": agg_response,
-                "method": "direct_apply"
-            })
-
-        # Strategy 2: Extract and try again
-        extracted = extract_search_replace(agg_response)
-        if extracted:
-            success2, result2 = apply_search_replace_directly(extracted, workdir)
-            if success2:
-                from ..apply_patch import rollback
-                rollback(workdir)
-                return PatchResult(diff_text=result2, metadata={
-                    "strategy": "self_consistency",
-                    "n_samples": len(samples),
-                    "consensus_file": most_common_file,
-                    "consensus_ratio": round(consensus_ratio, 2),
-                    "aggregate_response": agg_response,
-                    "method": "extract_then_apply"
-                })
-
-        # Strategy 3: Convert to diff format
-        diff_text = search_replace_to_diff(agg_response, workdir)
-        if diff_text:
+        # If only 1 sample or all identical, use it directly
+        if len(samples) == 1 or len(set(s.strip() for s in samples)) == 1:
+            diff_text = extract_search_replace(samples[0])
             return PatchResult(diff_text=diff_text, metadata={
-                "strategy": "self_consistency",
-                "n_samples": len(samples),
-                "consensus_file": most_common_file,
-                "consensus_ratio": round(consensus_ratio, 2),
-                "aggregate_response": agg_response,
-                "method": "convert_to_diff"
+                "strategy": "self_consistency", "n_samples": len(samples),
+                "unique_samples": 1, "raw_samples": samples,
             })
 
-        return PatchResult(diff_text="", metadata={
-            "strategy": "self_consistency",
-            "n_samples": len(samples),
-            "consensus_file": most_common_file,
-            "consensus_ratio": round(consensus_ratio, 2),
-            "reason": "patch_extraction_failed"
+        # Aggregate via LLM judge
+        samples_text = "\n\n---\n\n".join(
+            f"### Sample {i+1}:\n{s}" for i, s in enumerate(samples))
+
+        aggregate = llm_client.chat(
+            [{"role": "system", "content": AGGREGATE_SYSTEM},
+             {"role": "user", "content": AGGREGATE_USER.format(
+                 bug_id=bug_id, n_samples=len(samples), samples=samples_text)}],
+            purpose="sc_aggregate", attempt=attempt_index,
+            out_dir=out_dir, max_tokens=1200,
+            temperature=0.0,  # deterministic aggregation
+        )
+
+        if not aggregate:
+            diff_text = extract_search_replace(samples[0])
+            return PatchResult(diff_text=diff_text, metadata={
+                "strategy": "self_consistency", "n_samples": len(samples),
+                "fallback": "first_sample",
+            })
+
+        diff_text = extract_search_replace(aggregate)
+        return PatchResult(diff_text=diff_text, metadata={
+            "strategy": "self_consistency", "n_samples": len(samples),
+            "unique_samples": len(set(s.strip() for s in samples)),
+            "sample_temperature": SAMPLE_TEMPERATURE,
+            "raw_aggregate": aggregate,
         })

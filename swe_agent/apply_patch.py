@@ -57,6 +57,11 @@ def apply_patch(diff_text: str, workdir: Path) -> Tuple[bool, str]:
     if not diff_text or not diff_text.strip():
         return False, "Empty patch"
 
+    # Check if this is a search-replace format patch
+    if "FILE:" in diff_text and "SEARCH:" in diff_text and "REPLACE:" in diff_text:
+        # Use search-replace application directly
+        return apply_search_replace(diff_text, workdir)
+
     # First validate the diff format
     is_valid, error = validate_diff_format(diff_text)
     if not is_valid:
@@ -106,6 +111,86 @@ def apply_patch(diff_text: str, workdir: Path) -> Tuple[bool, str]:
 
     # All strategies failed
     return False, "Patch application failed with all strategies"
+
+
+def apply_search_replace(search_replace_text: str, workdir: Path) -> Tuple[bool, str]:
+    """
+    Apply a search-replace format patch.
+    Returns (success, error_message).
+    """
+    import re
+    # Match explicit newline after SEARCH: and REPLACE: to preserve leading whitespace in content
+    # Pattern: FILE: <path>\nSEARCH:\n<content>\nREPLACE:\n<content>
+    pattern = r'FILE:\s*(\S+)\s*SEARCH:\n(.*?)\nREPLACE:\n(.*?)(?=\nFILE:|\Z)'
+    matches = re.findall(pattern, search_replace_text, re.DOTALL)
+
+    if not matches:
+        return False, "No valid SEARCH/REPLACE blocks found"
+
+    for filepath, search_text, replace_text in matches:
+        # Strip only trailing whitespace to preserve leading indentation on each line
+        search_text = search_text.rstrip()
+        replace_text = replace_text.rstrip()
+
+        full_path = workdir / filepath
+        if not full_path.exists():
+            # Try to find the file
+            for p in workdir.rglob(filepath.split('/')[-1]):
+                if p.is_file():
+                    full_path = p
+                    break
+            else:
+                return False, f"File not found: {filepath}"
+
+        try:
+            content = full_path.read_text()
+            search_lines = search_text.split('\n')
+            replace_lines = replace_text.split('\n')
+            content_lines = content.split('\n')
+
+            # Find exact match first
+            start_idx = -1
+            for i in range(len(content_lines) - len(search_lines) + 1):
+                if all(content_lines[i + j] == search_lines[j] for j in range(len(search_lines))):
+                    start_idx = i
+                    break
+
+            if start_idx == -1:
+                # Try fuzzy match (strip whitespace for comparison)
+                search_stripped = [l.strip() for l in search_lines]
+                for i in range(len(content_lines) - len(search_lines) + 1):
+                    if all(content_lines[i + j].strip() == search_stripped[j] for j in range(len(search_lines))):
+                        start_idx = i
+                        break
+
+            if start_idx == -1:
+                return False, f"Could not find SEARCH text in {filepath}"
+
+            # Apply the replacement with indentation preservation
+            end_idx = start_idx + len(search_lines)
+            new_content_lines = []
+            for j, replace_line in enumerate(replace_lines):
+                if start_idx + j < len(content_lines):
+                    original_line = content_lines[start_idx + j]
+                    original_indent = len(original_line) - len(original_line.lstrip())
+                    original_whitespace = original_line[:original_indent]
+                    replace_stripped = replace_line.lstrip()
+                    new_content_lines.append(original_whitespace + replace_stripped)
+                else:
+                    new_content_lines.append(replace_line)
+
+            final_content_lines = content_lines[:start_idx] + new_content_lines + content_lines[end_idx:]
+            original_ending = '\n' if content.endswith('\n') else ''
+            new_content = '\n'.join(final_content_lines)
+            if original_ending and not new_content.endswith('\n'):
+                new_content += '\n'
+            full_path.write_text(new_content)
+            return True, ""
+
+        except Exception as e:
+            return False, f"Error applying patch to {filepath}: {str(e)}"
+
+    return True, ""
 
 
 def apply_patch_manually(diff_text: str, workdir: Path) -> Tuple[bool, str]:

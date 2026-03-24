@@ -1,30 +1,17 @@
-# swe_agent/__main__.py
+# single_shot_thought/__main__.py
 """
-Entry point for running swe_agent as a module.
-Usage:
-  python -m swe_agent.runner --project Lang --bug 1 --baseline agentless
-  python -m swe_agent.eval --bugs benchmarks/defects4j_small.txt --baseline agentless
+Entry point:
+  python -m single_shot_thought runner --project Lang --bug 1 --baseline cot
+  python -m single_shot_thought eval --bugs bugs.txt --baseline cot react
 """
 import sys
 import argparse
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="SWE-Agent: Multi-Baseline APR for Defects4J",
-        prog="swe_agent"
-    )
-    parser.add_argument(
-        "command",
-        choices=["runner", "eval"],
-        help="Command to run: 'runner' for single bug, 'eval' for batch evaluation"
-    )
-    parser.add_argument(
-        "args",
-        nargs=argparse.REMAINDER,
-        help="Arguments to pass to the command"
-    )
-
+    parser = argparse.ArgumentParser(prog="single_shot_thought")
+    parser.add_argument("command", choices=["runner", "eval"])
+    parser.add_argument("args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
     if args.command == "runner":

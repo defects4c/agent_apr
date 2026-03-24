@@ -7,8 +7,7 @@ Budget: 1 LLM call per attempt (cheapest possible).
 """
 from pathlib import Path
 from .base import PatchGenerator, PatchResult
-from ._shared import (build_fail_context, build_location_context,
-                       extract_search_replace, PATCH_SYSTEM)
+from ._shared import (build_fail_context, build_location_context, PATCH_SYSTEM)
 
 USER_TEMPLATE = """{fail_context}
 
@@ -42,13 +41,7 @@ class StandardPatchGenerator(PatchGenerator):
             out_dir=out_dir, max_tokens=1200,
         )
 
-        if not response:
-            return PatchResult(diff_text="", metadata={
-                "strategy": "standard", "raw_response": "", "reason": "empty_response"
-            })
-
-        diff_text = extract_search_replace(response)
-        return PatchResult(
-            diff_text=diff_text,
-            metadata={"strategy": "standard", "raw_response": response},
-        )
+        # Return the raw response - apply_patch will handle search-replace format
+        return PatchResult(diff_text=response or "", metadata={
+            "strategy": "standard", "raw_response": response or "", "format": "search_replace"
+        })

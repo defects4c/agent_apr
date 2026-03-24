@@ -8,8 +8,7 @@ Stateful: maintains reflection history across attempts.
 """
 from pathlib import Path
 from .base import PatchGenerator, PatchResult
-from ._shared import (build_fail_context, build_location_context, PATCH_SYSTEM, extract_search_replace)
-from .agentless import apply_search_replace_directly, search_replace_to_diff
+from ._shared import (build_fail_context, build_location_context, PATCH_SYSTEM)
 
 
 REFLECTION_SYSTEM = """You are an automated program repair system that learns from failures.
@@ -104,44 +103,9 @@ class ReflexionPatchGenerator(PatchGenerator):
             out_dir=out_dir, max_tokens=2000
         )
 
-        # Store this attempt's result for future reflection
-        # The runner will call update_feedback after validation
-        self.current_response = response or ""
-
-        if not response:
-            return PatchResult(diff_text="", metadata={
-                "strategy": "reflexion", "raw_response": "", "reason": "empty_response"
-            })
-
-        # Strategy 1: Try to apply search-replace directly
-        success, result = apply_search_replace_directly(response, workdir)
-        if success:
-            from ..apply_patch import rollback
-            rollback(workdir)
-            return PatchResult(diff_text=result, metadata={
-                "strategy": "reflexion", "raw_response": response, "method": "direct_apply"
-            })
-
-        # Strategy 2: Extract and try again
-        extracted = extract_search_replace(response)
-        if extracted:
-            success2, result2 = apply_search_replace_directly(extracted, workdir)
-            if success2:
-                from ..apply_patch import rollback
-                rollback(workdir)
-                return PatchResult(diff_text=result2, metadata={
-                    "strategy": "reflexion", "raw_response": response, "method": "extract_then_apply"
-                })
-
-        # Strategy 3: Convert to diff format
-        diff_text = search_replace_to_diff(response, workdir)
-        if diff_text:
-            return PatchResult(diff_text=diff_text, metadata={
-                "strategy": "reflexion", "raw_response": response, "method": "convert_to_diff"
-            })
-
-        return PatchResult(diff_text="", metadata={
-            "strategy": "reflexion", "raw_response": response, "reason": "patch_extraction_failed"
+        # Return the raw response - apply_patch will handle search-replace format
+        return PatchResult(diff_text=response or "", metadata={
+            "strategy": "reflexion", "raw_response": response or "", "format": "search_replace"
         })
 
     def update_feedback(self, status: str, feedback: str):

@@ -7,8 +7,8 @@ Budget: n_samples + 1 calls per attempt (candidates + judge).
 """
 from pathlib import Path
 from .base import PatchGenerator, PatchResult
-from ._shared import (build_fail_context, build_location_context, PATCH_SYSTEM, extract_search_replace)
-from .agentless import apply_search_replace_directly, search_replace_to_diff
+from ._shared import (build_fail_context, build_location_context, PATCH_SYSTEM, extract_search_replace,
+                       apply_search_replace_directly, search_replace_to_diff)
 from ..config import MAX_LLM_CALLS_PER_ATTEMPT
 
 

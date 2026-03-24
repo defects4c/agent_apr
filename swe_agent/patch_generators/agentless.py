@@ -23,9 +23,10 @@ SEARCH: exact code to find (must match source exactly including whitespace)
 REPLACE: new code to replace with
 
 RULES:
-1. SEARCH must match the source code EXACTLY - character for character, including all whitespace and indentation
+1. SEARCH must match the source code EXACTLY - character for character, including ALL whitespace and indentation
 2. Include enough context (5-10 lines before and after the change) to make the search unique
 3. Only change the buggy logic - do not modify unrelated code
+4. PRESERVE INDENTATION: Copy ALL leading spaces/tabs from the source - do not strip them
 
 CRITICAL - Understanding Stack Traces:
 When you see a stack trace like:
@@ -41,7 +42,8 @@ For hex number parsing bugs specifically:
 - 8 hex digits can exceed Integer.MAX_VALUE (2147483647)
 - The fix is usually changing "> 8" to ">= 8" or similar threshold adjustment
 
-INDENTATION: Match the exact indentation style (tabs or spaces) used in the source file."""
+INDENTATION: Match the exact indentation style (tabs or spaces) used in the source file.
+Every line in SEARCH must have the same leading whitespace as the source file."""
 
 USER_TEMPLATE = """## Bug: {bug_id}
 
@@ -90,18 +92,13 @@ REPLACE:
 
 def build_location_block(hits, workdir: Path) -> str:
     """Build location blocks with actual source code from workdir."""
+    from ._shared import _find_source_file
     blocks = []
     for h in hits:
-        # Load actual source code from workdir
-        file_path = workdir / h.filepath
-        if not file_path.exists():
-            # Try to find the file
-            for p in workdir.rglob(h.filepath.split('/')[-1]):
-                if p.is_file():
-                    file_path = p
-                    break
+        # Use the shared file finder to resolve the path
+        file_path = _find_source_file(workdir, h.filepath)
 
-        if file_path.exists():
+        if file_path is not None:
             try:
                 content = file_path.read_text().splitlines()
                 # Get the actual lines (adjust for 0-indexed)
@@ -146,9 +143,9 @@ def search_replace_to_diff(search_replace_text: str, workdir: Path) -> str:
     matches = re.findall(pattern, search_replace_text, re.DOTALL)
 
     for filepath, search_text, replace_text in matches:
-        # Clean up search and replace - strip leading/trailing whitespace but preserve internal
-        search_text = search_text.strip()
-        replace_text = replace_text.strip()
+        # Clean up search and replace - strip only trailing whitespace to preserve indentation
+        search_text = search_text.rstrip()
+        replace_text = replace_text.rstrip()
 
         # Find the file in workdir
         full_path = workdir / filepath
@@ -290,7 +287,7 @@ def apply_search_replace_directly(search_replace_text: str, workdir: Path) -> tu
             replace_lines = replace_text.split('\n')
             content_lines = content.split('\n')
 
-            # Find exact match
+            # Find exact match first
             start_idx = -1
             for i in range(len(content_lines) - len(search_lines) + 1):
                 if all(content_lines[i + j] == search_lines[j] for j in range(len(search_lines))):
@@ -298,7 +295,7 @@ def apply_search_replace_directly(search_replace_text: str, workdir: Path) -> tu
                     break
 
             if start_idx == -1:
-                # Try fuzzy match
+                # Try fuzzy match (strip whitespace for comparison)
                 search_stripped = [l.strip() for l in search_lines]
                 for i in range(len(content_lines) - len(search_lines) + 1):
                     if all(content_lines[i + j].strip() == search_stripped[j] for j in range(len(search_lines))):
@@ -308,14 +305,32 @@ def apply_search_replace_directly(search_replace_text: str, workdir: Path) -> tu
             if start_idx == -1:
                 return False, f"Could not find SEARCH text in {filepath}"
 
-            # Apply the replacement
+            # Apply the replacement with indentation preservation
             end_idx = start_idx + len(search_lines)
-            new_content_lines = content_lines[:start_idx] + replace_lines + content_lines[end_idx:]
+
+            # Calculate indentation for each line from the original content
+            new_content_lines = []
+            for j, replace_line in enumerate(replace_lines):
+                # If this position exists in the original search, preserve its indentation
+                if start_idx + j < len(content_lines):
+                    original_line = content_lines[start_idx + j]
+                    # Get leading whitespace from original
+                    original_indent = len(original_line) - len(original_line.lstrip())
+                    original_whitespace = original_line[:original_indent]
+                    # Get leading whitespace from replacement
+                    replace_stripped = replace_line.lstrip()
+                    # Apply original indentation
+                    new_content_lines.append(original_whitespace + replace_stripped)
+                else:
+                    new_content_lines.append(replace_line)
+
+            # Build final content
+            final_content_lines = content_lines[:start_idx] + new_content_lines + content_lines[end_idx:]
 
             # Write the modified file
             # Preserve the original file's line ending
             original_ending = '\n' if content.endswith('\n') else ''
-            new_content = '\n'.join(new_content_lines)
+            new_content = '\n'.join(final_content_lines)
             if original_ending and not new_content.endswith('\n'):
                 new_content += '\n'
             full_path.write_text(new_content)
@@ -385,23 +400,9 @@ class AgentlessPatchGenerator(PatchGenerator):
             max_tokens=1500
         )
 
-        # First try to apply as search-replace directly (more reliable)
-        success, result = apply_search_replace_directly(response or "", workdir)
-
-        if success:
-            # Rollback the applied patch - we just want the diff
-            from ..apply_patch import rollback
-            rollback(workdir)
-            return PatchResult(diff_text=result, metadata={"strategy": "agentless", "raw_response": response or "", "format": "search_replace"})
-
-        # If search-replace fails, try converting to unified diff
-        diff_text = search_replace_to_diff(response or "", workdir)
-
-        # If conversion failed, try to use raw response as diff
-        if not diff_text and response:
-            diff_text = response
-
-        return PatchResult(diff_text=diff_text, metadata={"strategy": "agentless", "raw_response": response or ""})
+        # Return the raw response which contains the search-replace format
+        # The apply_patch function will handle search-replace format directly
+        return PatchResult(diff_text=response or "", metadata={"strategy": "agentless", "raw_response": response or "", "format": "search_replace"})
 
     @staticmethod
     def _build_locations_from_snippets(failing_info: dict, workdir: Path) -> str:

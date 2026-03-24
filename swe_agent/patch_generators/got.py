@@ -8,8 +8,8 @@ Budget: 2-3 calls per attempt (graph construction + synthesis).
 """
 from pathlib import Path
 from .base import PatchGenerator, PatchResult
-from ._shared import (build_fail_context, build_location_context, PATCH_SYSTEM, extract_search_replace)
-from .agentless import apply_search_replace_directly, search_replace_to_diff
+from ._shared import (build_fail_context, build_location_context, PATCH_SYSTEM, extract_search_replace,
+                       apply_search_replace_directly, search_replace_to_diff)
 
 
 GRAPH_SYSTEM = """You are building a reasoning graph for a Java bug.

@@ -263,8 +263,9 @@ def search_replace_to_diff(search_replace_text: str, workdir: Path) -> str:
     matches = re.findall(pattern, search_replace_text, re.DOTALL)
 
     for filepath, search_text, replace_text in matches:
-        search_text = search_text.strip()
-        replace_text = replace_text.strip()
+        # Strip only trailing whitespace to preserve leading indentation
+        search_text = search_text.rstrip()
+        replace_text = replace_text.rstrip()
 
         # Find the file in workdir
         full_path = workdir / filepath
