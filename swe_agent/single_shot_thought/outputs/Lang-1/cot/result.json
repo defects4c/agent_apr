@@ -1,0 +1,6 @@
+{
+  "bug": "Lang_1",
+  "baseline": "cot",
+  "status": "error",
+  "notes": "'NoneType' object is not subscriptable"
+}

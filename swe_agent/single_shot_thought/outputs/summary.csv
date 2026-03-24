@@ -1,0 +1,13 @@
+bug,baseline,status,attempts_used,llm_calls,total_tokens,verify_time_sec
+Lang_1,agentless,repaired,1,1,3490,1.44
+Lang_1,cot,error,0,0,0,0
+Lang_1,openhands,error,0,0,0,0
+Lang_1,reflexion,error,0,0,0,0
+Lang_5,agentless,error,0,0,0,0
+Lang_5,cot,error,0,0,0,0
+Lang_5,openhands,error,0,0,0,0
+Lang_5,reflexion,error,0,0,0,0
+Math_1,agentless,error,0,0,0,0
+Math_1,cot,error,0,0,0,0
+Math_1,openhands,error,0,0,0,0
+Math_1,reflexion,error,0,0,0,0

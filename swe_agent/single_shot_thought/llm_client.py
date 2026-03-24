@@ -3,7 +3,7 @@ import hashlib, json, time
 from datetime import datetime, timezone
 from pathlib import Path
 from openai import OpenAI
-from .config import (OPENAI_API_KEY, OPENAI_BASE_URL, GPT_MODEL,
+from .config import (OPENAI_API_KEY, OPENAI_API_BASE_URL, GPT_MODEL,
                      MAX_LLM_CALLS_PER_BUG, MAX_TOKENS_PER_BUG)
 
 
@@ -33,8 +33,7 @@ class LLMClient:
         self._tokens = {"prompt": 0, "completion": 0, "total": 0}
         self._latency = 0.0
         self.verbose = verbose
-        print ("OPENAI_API_KEY", OPENAI_API_KEY , "OPENAI_BASE_URL:", OPENAI_BASE_URL )
-        self._client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+        self._client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_API_BASE_URL)
 
     def chat(self, messages: list, purpose: str, attempt: int,
              out_dir: Path, max_tokens: int = 1000,

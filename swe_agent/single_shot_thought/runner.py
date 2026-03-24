@@ -1,6 +1,6 @@
 # swe_agent/runner.py
 """
-CLI: python -m single_shot_thought.runner --project Lang --bug 1 --baseline cot
+CLI: python -m single_shot_thought runner --project Chart --bug 1 --baseline react
 """
 import argparse
 import json
@@ -14,7 +14,6 @@ from .trace import TraceWriter
 from .localize import localize
 from .apply_patch import apply_patch, init_git_baseline, rollback
 from .tests_runner import run_functionality_tests, run_regression_tests, get_trigger_tests
-# Prompting-strategy baselines
 from .patch_generators.cot import CoTPatchGenerator
 from .patch_generators.reflexion import ReflexionPatchGenerator
 from .patch_generators.tot import ToTPatchGenerator
@@ -41,8 +40,8 @@ GENERATORS = {
     "function_calling": FunctionCallingPatchGenerator,
 }
 
-_VERBOSE_LLM = True 
-_VERBOSE_PATCH = True 
+_VERBOSE_LLM = False
+_VERBOSE_PATCH = False
 
 
 def set_verbose_flags(llm_verbose=False, patch_verbose=False):
@@ -51,29 +50,38 @@ def set_verbose_flags(llm_verbose=False, patch_verbose=False):
     _VERBOSE_PATCH = patch_verbose
 
 
-def _print_patch_diff(diff_text, status):
-    if not _VERBOSE_PATCH:
-        return
-    print("\n" + "=" * 70)
-    sc = Colors.GREEN if status == "OK" else Colors.RED
-    print(colorize(f" [PATCH] Status: {status}", Colors.BOLD + sc))
-    for line in diff_text.splitlines()[:50]:
-        if line.startswith("+"): print(colorize(line, Colors.GREEN))
-        elif line.startswith("-"): print(colorize(line, Colors.RED))
-        elif line.startswith("@@"): print(colorize(line, Colors.YELLOW))
-        else: print(line)
-    print("=" * 70)
+def _v(msg, color=Colors.DIM):
+    if _VERBOSE_PATCH:
+        print(colorize(msg, color))
 
 
-def _print_status(phase, status, details=""):
+def _vstatus(phase, status, details=""):
     if not _VERBOSE_PATCH:
         return
-    icons = {"OK": "✓", "PASS": "✓", "FAIL": "✗", "ERROR": "✗"}
-    icon = icons.get(status, "?")
-    sc = Colors.GREEN if status in ("OK", "PASS") else Colors.RED
-    print(f"  {colorize(icon, sc)} {phase}: {status}")
+    icon = colorize("✓", Colors.GREEN) if status in ("OK", "PASS") else colorize("✗", Colors.RED)
+    print(f"  {icon} {phase}: {status}")
     if details:
-        print(colorize(f"    → {details[:100]}", Colors.DIM))
+        print(colorize(f"    → {details[:200]}", Colors.DIM))
+
+
+def _vpatch(diff_text, status="GENERATED"):
+    if not _VERBOSE_PATCH or not diff_text:
+        return
+    sc = Colors.GREEN if "OK" in status or "FINAL" in status else Colors.YELLOW
+    print(colorize(f"\n  ── PATCH ({status}, {len(diff_text)} chars) ──", sc))
+    lines = diff_text.splitlines()
+    for line in lines[:30]:
+        if line.startswith("+"):
+            print(colorize(f"  {line}", Colors.GREEN))
+        elif line.startswith("-"):
+            print(colorize(f"  {line}", Colors.RED))
+        elif line.startswith("FILE:") or line.startswith("SEARCH:") or line.startswith("REPLACE:"):
+            print(colorize(f"  {line}", Colors.CYAN))
+        else:
+            print(f"  {line}")
+    if len(lines) > 30:
+        print(colorize(f"  ... ({len(lines) - 30} more lines)", Colors.DIM))
+    print(colorize("  ── END PATCH ──", sc))
 
 
 def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path,
@@ -97,72 +105,84 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path,
         "bug": bug_name, "baseline": baseline,
         "status": "unrepaired", "attempts_used": 0,
         "attempt_summaries": [],
-        "fl_mode": effective_fl,
-        "max_attempts": effective_max,
+        "fl_mode": effective_fl, "max_attempts": effective_max,
     }
 
-    if patch_verbose:
-        print(colorize(f"\n [REPAIR] {bug_name} | {baseline} | FL={effective_fl} | k={effective_max}",
-                        Colors.BOLD + Colors.CYAN))
+    _v(f"\n [REPAIR] {bug_name} | {baseline} | FL={effective_fl} | k={effective_max}",
+       Colors.BOLD + Colors.CYAN)
 
-    # 1. Checkout
+    # ── 1. Health check ──
+    if not d4j.health_check():
+        msg = f"Cannot reach defects4j webapp at {config.D4J_URL}"
+        _vstatus("health_check", "FAIL", msg)
+        result["status"] = "error"
+        result["notes"] = msg
+        _write_result(result, out_dir)
+        return result
+
+    # ── 2. Checkout ──
     try:
         d4j.checkout(project, bug_id, "b", workdir,
                      log_path=out_dir / "logs" / "checkout.log")
-        if patch_verbose:
-            _print_status("checkout", "OK")
+        _vstatus("checkout", "OK")
     except Exception as e:
+        _vstatus("checkout", "FAIL", str(e))
         result["status"] = "error"
         result["notes"] = str(e)
         _write_result(result, out_dir)
         return result
 
-    # 2. Pre-patch tests
-    n_before, failing_before, _ = d4j.test(
+    # ── 3. Pre-patch tests ──
+    n_before, failing_before, test_before_log = d4j.test(
         workdir, project, log_path=out_dir / "logs" / "test_before.log")
     if n_before == 0:
+        _v("  Tests already passing — skipping", Colors.GREEN)
         result["notes"] = "already passing"
         _write_result(result, out_dir)
         return result
-
-    if patch_verbose:
-        print(colorize(f"  {n_before} failing test(s)", Colors.YELLOW))
+    _v(f"  {n_before} failing test(s)", Colors.YELLOW)
 
     result["failing_count_before"] = n_before
     result["failing_tests_before"] = failing_before
 
     trigger_tests = get_trigger_tests(workdir, project)
     init_git_baseline(workdir)
-    fail_info = _load_fail_info(bug_name)
 
-    # Build test log for localization
-    test_log_path = out_dir / "logs" / "test_before.log"
-    test_log = ""
-    if test_log_path.exists():
-        test_log = test_log_path.read_text()
+    # ── 4. Get failure info (from Docker container, NOT local files) ──
+    fail_info = d4j.get_fail_info_from_container(workdir, project)
+    if fail_info:
+        _v(f"  Failure info: {len(fail_info)} test(s) with traces", Colors.CYAN)
+    else:
+        _v("  ⚠ No failure info (failing_tests file missing in container)", Colors.YELLOW)
+
+    # ── 5. Build test log for stack-trace FL ──
+    # Get test log with stack traces from Docker
+    test_log = d4j.get_test_log_with_traces(workdir, project)
     if "\tat" not in test_log:
+        # Supplement with fail_info if we have it
         for tc_sig, info in fail_info.items():
             test_log += f"--- {tc_sig}\n"
             test_log += (info or {}).get("error_message", "") + "\n"
             test_log += (info or {}).get("stack_trace", "") + "\n"
 
-    # Localize with selected FL mode
+    # ── 6. Localize ──
     bug_info_dir = os.path.join(config.D4J_FOLDER, bug_name)
     loc_hits = localize(workdir, project, test_log, bug_info_dir,
                         fl_mode=effective_fl, bug_id=str(bug_id))
+    if loc_hits:
+        _v(f"  FL[{effective_fl}]: {len(loc_hits)} location(s)", Colors.CYAN)
+        for h in loc_hits:
+            _v(f"    {h.filepath} L{h.start_line}-{h.end_line} (conf={h.confidence:.2f})",
+               Colors.DIM)
+    else:
+        _v(f"  ⚠ FL[{effective_fl}]: no locations found", Colors.RED)
 
-    if patch_verbose and loc_hits:
-        print(colorize(f"  FL[{effective_fl}]: {len(loc_hits)} location(s)", Colors.CYAN))
-
-    # 3. Attempt loop
+    # ── 7. Attempt loop ──
     v_time = {"apply_patch": 0.0, "compile": 0.0, "func_test": 0.0, "reg_test": 0.0}
 
     for attempt in range(1, effective_max + 1):
         result["attempts_used"] = attempt
-        attempt_status = {}
-
-        if patch_verbose:
-            print(colorize(f"\n  [ATTEMPT {attempt}/{effective_max}]", Colors.BOLD + Colors.YELLOW))
+        _v(f"\n  [ATTEMPT {attempt}/{effective_max}]", Colors.BOLD + Colors.YELLOW)
 
         # a) Generate patch
         try:
@@ -170,31 +190,29 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path,
                 bug_name, workdir, fail_info, trigger_tests, loc_hits,
                 attempt, out_dir, llm)
         except BudgetExceededError as e:
+            _v(f"  Budget exceeded: {e}", Colors.RED)
             trace.log({"bug": bug_name, "baseline": baseline, "attempt": attempt,
-                       "phase": "patch_gen", "status": "FAIL",
-                       "reason_code": reason.TIMEOUT, "reason": str(e)})
-            if patch_verbose:
-                print(colorize(f"  Budget exceeded: {e}", Colors.RED))
+                       "phase": "patch_gen", "status": "FAIL", "reason_code": reason.TIMEOUT})
             break
 
         _save_attempt(patch_result, attempt, out_dir)
+
         if not patch_result.diff_text:
-            result["attempt_summaries"].append(
-                {"attempt": attempt, "status": "EMPTY_DIFF"})
+            _vstatus("patch_gen", "FAIL", "Empty patch (no diff produced)")
+            result["attempt_summaries"].append({"attempt": attempt, "status": "EMPTY_DIFF"})
             if baseline == "reflexion" and hasattr(gen, "update_feedback"):
                 gen.update_feedback("empty_patch", "No patch generated.")
             continue
 
-        if patch_verbose:
-            _print_patch_diff(patch_result.diff_text, "GENERATED")
+        _vpatch(patch_result.diff_text, "GENERATED")
 
         # b) Budget check
         try:
             budget.check_patch(patch_result.diff_text)
         except Exception as e:
-            rc = reason.PATCH_SCOPE_VIOLATION
+            _vstatus("budget_check", "FAIL", str(e))
             result["attempt_summaries"].append(
-                {"attempt": attempt, "status": "BUDGET_FAIL", "reason_code": rc})
+                {"attempt": attempt, "status": "BUDGET_FAIL", "reason_code": reason.PATCH_SCOPE_VIOLATION})
             continue
 
         # c) Apply patch
@@ -202,15 +220,15 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path,
         ok, err = apply_patch(patch_result.diff_text, workdir)
         v_time["apply_patch"] += time.monotonic() - t0
         if not ok:
+            _vstatus("apply_patch", "FAIL", err)
             result["attempt_summaries"].append(
                 {"attempt": attempt, "status": reason.PATCH_APPLY_FAILED,
-                 "reason_code": reason.PATCH_APPLY_HUNK_FAILED})
+                 "reason_code": reason.PATCH_APPLY_HUNK_FAILED, "detail": err[:200]})
             if baseline == "reflexion" and hasattr(gen, "update_feedback"):
                 gen.update_feedback("patch_apply_failed", f"Apply failed: {err[:200]}")
             rollback(workdir)
             continue
-        if patch_verbose:
-            _print_status("apply_patch", "OK")
+        _vstatus("apply_patch", "OK")
 
         # d) Compile
         t0 = time.monotonic()
@@ -219,37 +237,35 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path,
         v_time["compile"] += time.monotonic() - t0
         if not ok:
             rc = reason.parse_build_reason(build_log)
+            _vstatus("compile", "FAIL", f"{rc}: {build_log[-200:]}")
             result["attempt_summaries"].append(
-                {"attempt": attempt, "status": reason.BUILD_FAILED, "reason_code": rc})
+                {"attempt": attempt, "status": reason.BUILD_FAILED, "reason_code": rc,
+                 "detail": build_log[-300:]})
             if baseline == "reflexion" and hasattr(gen, "update_feedback"):
                 gen.update_feedback("build_failed", f"Compile failed: {build_log[:200]}")
-            if patch_verbose:
-                _print_status("compile", "FAIL", rc)
             rollback(workdir)
             continue
-        if patch_verbose:
-            _print_status("compile", "OK")
+        _vstatus("compile", "OK")
 
-        # e) Functionality gate
+        # e) Functionality tests
         t0 = time.monotonic()
         n_func, still_failing, _ = run_functionality_tests(
             workdir, trigger_tests, project,
             log_path=out_dir / "logs" / f"attempt_{attempt:03d}_func.log")
         v_time["func_test"] += time.monotonic() - t0
         if n_func > 0:
+            _vstatus("func_test", "FAIL", f"{n_func} test(s) still failing: {still_failing[:3]}")
             result["attempt_summaries"].append(
                 {"attempt": attempt, "status": reason.FUNCTIONALITY_FAILED,
-                 "reason_code": reason.TRIGGER_TEST_STILL_FAILING})
+                 "reason_code": reason.TRIGGER_TEST_STILL_FAILING,
+                 "detail": str(still_failing[:3])})
             if baseline == "reflexion" and hasattr(gen, "update_feedback"):
                 gen.update_feedback("func_failed", f"Tests failing: {still_failing[:3]}")
-            if patch_verbose:
-                _print_status("func_test", "FAIL", f"{n_func} failing")
             rollback(workdir)
             continue
-        if patch_verbose:
-            _print_status("func_test", "PASS")
+        _vstatus("func_test", "PASS")
 
-        # f) Regression gate
+        # f) Regression tests
         t0 = time.monotonic()
         n_reg, reg_failing, _ = run_regression_tests(
             workdir, project,
@@ -257,31 +273,29 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path,
         v_time["reg_test"] += time.monotonic() - t0
         new_failures = set(reg_failing) - set(failing_before)
         if new_failures:
+            _vstatus("reg_test", "FAIL", f"{len(new_failures)} new failure(s): {list(new_failures)[:3]}")
             result["attempt_summaries"].append(
                 {"attempt": attempt, "status": reason.REGRESSION_FAILED,
-                 "reason_code": reason.NEW_FAILURES_INTRODUCED})
+                 "reason_code": reason.NEW_FAILURES_INTRODUCED,
+                 "detail": str(list(new_failures)[:3])})
             if baseline == "reflexion" and hasattr(gen, "update_feedback"):
                 gen.update_feedback("regression", f"New failures: {list(new_failures)[:3]}")
-            if patch_verbose:
-                _print_status("reg_test", "FAIL", f"{len(new_failures)} new")
             rollback(workdir)
             continue
-        if patch_verbose:
-            _print_status("reg_test", "PASS")
+        _vstatus("reg_test", "PASS")
 
-        # g) REPAIRED
+        # g) REPAIRED ✓
         (out_dir / "patch.diff").write_text(patch_result.diff_text)
         trace.log({"bug": bug_name, "baseline": baseline, "attempt": attempt,
                    "phase": "reg_test", "status": "OK", "reason_code": reason.REPAIRED})
         result["status"] = "repaired"
         result["failing_count_after"] = 0
-        result["attempt_summaries"].append(
-            {"attempt": attempt, "status": reason.REPAIRED})
-        if patch_verbose:
-            print(colorize("\n  ★ REPAIRED!", Colors.BOLD + Colors.GREEN))
+        result["attempt_summaries"].append({"attempt": attempt, "status": reason.REPAIRED})
+        _v(f"\n  ★ REPAIRED at attempt {attempt}!", Colors.BOLD + Colors.GREEN)
+        _vpatch(patch_result.diff_text, "FINAL")
         break
 
-    # 4. Finalize
+    # ── Finalize ──
     v_time["total"] = sum(v_time.values())
     result["time_sec"] = round(time.monotonic() - t_start, 1)
     result["llm"] = llm.summary()
@@ -296,13 +310,10 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path,
     return result
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
 def _save_attempt(patch_result, attempt, out_dir):
     att_dir = out_dir / "attempts"
     att_dir.mkdir(exist_ok=True)
-    diff_text = patch_result.diff_text or ""
-    (att_dir / f"{attempt:03d}.patch.diff").write_text(diff_text)
+    (att_dir / f"{attempt:03d}.patch.diff").write_text(patch_result.diff_text or "")
     (att_dir / f"{attempt:03d}.meta.json").write_text(
         json.dumps(patch_result.metadata, indent=2, default=str))
 
@@ -311,46 +322,14 @@ def _write_result(result, out_dir):
     (out_dir / "result.json").write_text(json.dumps(result, indent=2, default=str))
 
 
-def _event(bug, baseline, attempt, phase, status, reason_code, reason_msg="", metrics=None):
-    e = {"bug": bug, "baseline": baseline, "attempt": attempt,
-         "phase": phase, "status": status, "reason_code": reason_code}
-    if metrics:
-        e["metrics"] = metrics
-    return e
-
-
-def _load_fail_info(bug_name):
-    from .config import D4J_FOLDER
-    bug_dir = os.path.join(D4J_FOLDER, bug_name)
-    fail_info = {}
-    tc_sig = None
-    failing_tests_path = os.path.join(bug_dir, "failing_tests")
-    if not os.path.exists(failing_tests_path):
-        return {}
-    with open(failing_tests_path) as f:
-        for line in f:
-            if line.startswith("--- "):
-                tc_name = line.split()[-1]
-                tc_sig = tc_name.replace("::", ".") + "()"
-                fail_info[tc_sig] = {"error_message": "", "stack_trace": ""}
-            elif tc_sig:
-                key = "stack_trace" if line.startswith("\tat") else "error_message"
-                fail_info[tc_sig][key] += line
-    return fail_info
-
-
-# ── CLI ──────────────────────────────────────────────────────────────────────
-
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--project", required=True)
     p.add_argument("--bug", required=True)
     p.add_argument("--baseline", default="cot", choices=list(GENERATORS.keys()))
     p.add_argument("--out", default="outputs")
-    p.add_argument("--fl-mode", default=None, choices=["oracle", "stack", "llm"],
-                   help="FL mode: oracle (ground truth), stack (traces), llm (defects4j info)")
-    p.add_argument("--max-attempts", type=int, default=None,
-                   help="Override MAX_ATTEMPTS_PER_BUG (pass@k = this value)")
+    p.add_argument("--fl-mode", default=None, choices=["oracle", "stack", "llm"])
+    p.add_argument("--max-attempts", type=int, default=None)
     p.add_argument("--llm_verbose", action="store_true")
     p.add_argument("--patch_verbose", action="store_true")
     args = p.parse_args()

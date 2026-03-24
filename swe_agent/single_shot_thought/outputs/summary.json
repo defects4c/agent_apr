@@ -1,0 +1,38 @@
+{
+  "agentless": {
+    "baseline": "agentless",
+    "total": 3,
+    "repaired": 1,
+    "repair_rate": "33.3%",
+    "llm_calls_median": 0,
+    "tokens_median": 0,
+    "verify_time_median": 0
+  },
+  "cot": {
+    "baseline": "cot",
+    "total": 3,
+    "repaired": 0,
+    "repair_rate": "0.0%",
+    "llm_calls_median": 0,
+    "tokens_median": 0,
+    "verify_time_median": 0
+  },
+  "openhands": {
+    "baseline": "openhands",
+    "total": 3,
+    "repaired": 0,
+    "repair_rate": "0.0%",
+    "llm_calls_median": 0,
+    "tokens_median": 0,
+    "verify_time_median": 0
+  },
+  "reflexion": {
+    "baseline": "reflexion",
+    "total": 3,
+    "repaired": 0,
+    "repair_rate": "0.0%",
+    "llm_calls_median": 0,
+    "tokens_median": 0,
+    "verify_time_median": 0
+  }
+}

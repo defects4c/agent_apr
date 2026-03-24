@@ -1,9 +1,9 @@
 # swe_agent/localize.py
 """
-Fault localization module with multiple modes:
-  oracle → Defects4J buggy-lines ground truth
-  stack  → parse stack traces from test failure logs (default)
-  llm    → defects4j info + LLM enrichment
+Fault localization with multiple modes:
+  oracle → buggy-lines ground truth (local data OR from Docker container)
+  stack  → parse stack traces from test failure logs
+  llm    → defects4j info → modified sources → resolve files
 """
 import csv
 import json
@@ -28,84 +28,88 @@ class LocalizationHit:
 def localize(workdir: Path, project: str, test_log: str,
              bug_info_dir: Optional[str] = None,
              fl_mode: str = None, bug_id: str = "") -> List[LocalizationHit]:
-    """Main dispatcher. Calls oracle/stack/llm based on fl_mode."""
+    """Main dispatcher."""
     mode = fl_mode or config.FL_MODE
 
     if mode == "oracle":
         hits = _oracle_fl(project, bug_id, workdir)
         if hits:
             return hits
-        # Fallback to stack if oracle data missing
-        mode = "stack"
-
-    if mode == "stack":
-        hits = _stack_trace_fl(workdir, test_log)
-        if bug_info_dir:
-            hits = _enrich_with_snippet_data(hits, bug_info_dir, workdir)
-        return hits[:3]
+        # Fallback: try llm mode (defects4j info → modified sources)
+        print(f"  ⚠ Oracle FL data not found for {project}-{bug_id}, falling back to llm FL")
+        hits = _llm_fl(project, bug_id, workdir)
+        if hits:
+            return hits
+        # Last resort: stack trace
+        print(f"  ⚠ LLM FL also empty, falling back to stack trace FL")
+        return _stack_trace_fl(workdir, test_log)[:3]
 
     if mode == "llm":
         hits = _llm_fl(project, bug_id, workdir)
-        return hits[:3]
+        if hits:
+            return hits
+        return _stack_trace_fl(workdir, test_log)[:3]
 
-    return _stack_trace_fl(workdir, test_log)[:3]
+    # Default: stack
+    hits = _stack_trace_fl(workdir, test_log)
+    if bug_info_dir and os.path.isdir(bug_info_dir):
+        hits = _enrich_with_snippet_data(hits, bug_info_dir, workdir)
+    return hits[:3]
 
 
-# ── Oracle FL: Defects4J buggy-lines/buggy-methods ────────────────────────
+# ── Oracle FL ─────────────────────────────────────────────────────────────
 
 def _oracle_fl(project: str, bug_id: str, workdir: Path) -> List[LocalizationHit]:
-    """Load ground-truth FL from Defects4J buggy-lines data."""
+    """Load ground-truth FL.
+    Try 1: local buggy-lines files (FL_DATA_DIR/buggy-lines/Chart-1.buggy.lines)
+    Try 2: get modified classes from Docker container via defects4j export
+    """
+    # Try local data files first
     data_dir = config.FL_DATA_DIR
     bl_file = os.path.join(data_dir, "buggy-lines", f"{project}-{bug_id}.buggy.lines")
-    bm_file = os.path.join(data_dir, "buggy-methods", f"{project}-{bug_id}.buggy.methods")
-
-    files_lines = {}
     if os.path.exists(bl_file):
-        with open(bl_file) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split("#")
-                if len(parts) >= 2:
-                    fpath = parts[0]
-                    try:
-                        lineno = int(parts[1])
-                    except ValueError:
-                        continue
-                    files_lines.setdefault(fpath, []).append(lineno)
+        return _parse_buggy_lines(bl_file, project, bug_id, workdir)
 
-    if not files_lines:
-        return []
+    # Try alternate naming
+    bl_file2 = os.path.join(data_dir, "buggy-lines", f"{project}_{bug_id}.buggy.lines")
+    if os.path.exists(bl_file2):
+        return _parse_buggy_lines(bl_file2, project, bug_id, workdir)
+
+    # No local data → fall through (caller will fallback to llm/stack)
+    return []
+
+
+def _parse_buggy_lines(bl_file: str, project: str, bug_id: str, workdir: Path) -> List[LocalizationHit]:
+    files_lines = {}
+    with open(bl_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("#")
+            if len(parts) >= 2:
+                fpath = parts[0]
+                try:
+                    lineno = int(parts[1])
+                except ValueError:
+                    continue
+                files_lines.setdefault(fpath, []).append(lineno)
 
     entries = []
-    for rank, (fpath, lines) in enumerate(files_lines.items(), 1):
+    for fpath, lines in files_lines.items():
         lines.sort()
         snippet = _load_snippet(workdir, fpath, min(lines) - 5, max(lines) + 5)
         entries.append(LocalizationHit(
             filepath=fpath,
             start_line=min(lines), end_line=max(lines),
-            confidence=1.0, snippet=snippet,
-            is_bug_source=True,
+            confidence=1.0, snippet=snippet, is_bug_source=True,
         ))
-
-    # Enrich with method names from buggy-methods
-    if os.path.exists(bm_file):
-        with open(bm_file) as f:
-            methods = [m.strip() for m in f if m.strip()]
-        for entry in entries:
-            for m in methods:
-                if entry.filepath in m:
-                    entry.method_name = m.split("#")[0] if "#" in m else m
-                    break
-
     return entries
 
 
 # ── Stack Trace FL ────────────────────────────────────────────────────────
 
 def _stack_trace_fl(workdir: Path, test_log: str) -> List[LocalizationHit]:
-    """Parse stack traces for file:line patterns."""
     hits = []
     pattern = r"at\s+([\w.$]+)\.(\w+)\(([\w/.]+\.java):(\d+)\)"
     matches = re.findall(pattern, test_log)
@@ -126,8 +130,7 @@ def _stack_trace_fl(workdir: Path, test_log: str) -> List[LocalizationHit]:
         hits.append(LocalizationHit(
             filepath=filepath,
             start_line=start_line, end_line=end_line,
-            confidence=confidence,
-            method_name=f"{cls}.{method}",
+            confidence=confidence, method_name=f"{cls}.{method}",
         ))
 
     hits.sort(key=lambda h: h.confidence, reverse=True)
@@ -136,24 +139,32 @@ def _stack_trace_fl(workdir: Path, test_log: str) -> List[LocalizationHit]:
     return hits[:3]
 
 
-# ── LLM FL (defects4j info fallback) ─────────────────────────────────────
+# ── LLM FL (defects4j info → modified sources) ───────────────────────────
 
 def _llm_fl(project: str, bug_id: str, workdir: Path) -> List[LocalizationHit]:
-    """Extract FL from defects4j info output (modified sources)."""
+    """Get modified sources from defects4j, resolve to actual files."""
     from . import defects4j as d4j
-    info_text = d4j.get_bug_info(project, bug_id)
-    modified = []
-    in_sources = False
-    for line in info_text.splitlines():
-        if line.strip().startswith("List of modified sources:"):
-            in_sources = True
-            continue
-        if in_sources:
-            if line.startswith("---"):
-                break
-            src = line.strip().lstrip("- ").strip()
-            if src and not src.startswith("Summary"):
-                modified.append(src)
+
+    # Get modified classes from Docker container
+    modified = d4j.get_modified_classes(workdir, project)
+    if not modified:
+        # Fallback: parse defects4j info
+        info = d4j.get_bug_info(project, bug_id)
+        modified = []
+        in_sources = False
+        for line in info.splitlines():
+            if "List of modified sources:" in line:
+                in_sources = True
+                continue
+            if in_sources:
+                if line.startswith("---"):
+                    break
+                src = line.strip().lstrip("- ").strip()
+                if src and not src.startswith("Summary"):
+                    modified.append(src)
+
+    if not modified:
+        return []
 
     entries = []
     for rank, class_name in enumerate(modified, 1):
@@ -183,28 +194,24 @@ def _enrich_with_snippet_data(hits, bug_info_dir, workdir):
     try:
         with open(snippet_path) as f:
             snippets = json.load(f)
-        bug_methods = [s for s in snippets if s.get("is_bug", False)]
         for hit in hits:
-            for bm in bug_methods:
+            for bm in [s for s in snippets if s.get("is_bug", False)]:
                 if bm["file"] in hit.filepath:
                     hit.is_bug_source = True
                     if not hit.snippet:
                         hit.snippet = bm.get("snippet", "")
-                        hit.method_name = bm.get("name", hit.method_name)
     except Exception:
         pass
     return hits
 
 
 def _load_snippet(workdir: Path, filepath: str, start: int, end: int) -> str:
-    workdir = Path(workdir)
     fp = _find_source_file(workdir, filepath)
     if fp is None:
         return ""
     try:
         lines = fp.read_text().splitlines()
-        s = max(0, start - 1)
-        e = min(len(lines), end)
+        s, e = max(0, start - 1), min(len(lines), end)
         return "\n".join(lines[s:e])
     except Exception:
         return ""
@@ -222,31 +229,30 @@ def _find_source_file(workdir, filepath):
     if "/" in filepath:
         parts = filepath.split("/")
         for i in range(len(parts)):
-            test_path = workdir / "/".join(parts[i:])
-            if test_path.exists() and test_path.is_file():
-                return test_path
+            p = workdir / "/".join(parts[i:])
+            if p.exists() and p.is_file():
+                return p
     for prefix in ["src/main/java", "src/java", "source"]:
-        test_path = workdir / prefix / filepath
-        if test_path.exists():
-            return test_path
+        p = workdir / prefix / filepath
+        if p.exists():
+            return p
     return None
 
 
 def _resolve_class(class_name, project_dir):
-    path_fragment = class_name.replace(".", os.sep) + ".java"
+    path_frag = class_name.replace(".", os.sep) + ".java"
     for root, dirs, files in os.walk(project_dir):
         dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("build", "target")]
         for f in files:
             if f.endswith(".java"):
                 rel = os.path.relpath(os.path.join(root, f), project_dir)
-                if rel.endswith(path_fragment):
+                if rel.endswith(path_frag):
                     return rel
     simple = class_name.rsplit(".", 1)[-1] + ".java"
     for root, dirs, files in os.walk(project_dir):
         dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("build", "target")]
         if simple in files:
-            full = os.path.join(root, simple)
-            rel = os.path.relpath(full, project_dir)
+            rel = os.path.relpath(os.path.join(root, simple), project_dir)
             if "test" not in rel.lower():
                 return rel
     return None
