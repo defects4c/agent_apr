@@ -1,10 +1,11 @@
 # swe_agent/runner.py
 """
-CLI: python -m single_shot_thought runner --project Chart --bug 1 --baseline react
+CLI: python -m single_shot_thought runner --project Chart --bug 1 --baseline cot
 """
 import argparse
 import json
 import os
+import re
 import time
 from pathlib import Path
 from . import config, defects4j as d4j, reason
@@ -69,19 +70,56 @@ def _vpatch(diff_text, status="GENERATED"):
         return
     sc = Colors.GREEN if "OK" in status or "FINAL" in status else Colors.YELLOW
     print(colorize(f"\n  ── PATCH ({status}, {len(diff_text)} chars) ──", sc))
-    lines = diff_text.splitlines()
-    for line in lines[:30]:
-        if line.startswith("+"):
+    for line in diff_text.splitlines()[:30]:
+        if line.startswith("+") and not line.startswith("+++"):
             print(colorize(f"  {line}", Colors.GREEN))
-        elif line.startswith("-"):
+        elif line.startswith("-") and not line.startswith("---"):
             print(colorize(f"  {line}", Colors.RED))
         elif line.startswith("FILE:") or line.startswith("SEARCH:") or line.startswith("REPLACE:"):
             print(colorize(f"  {line}", Colors.CYAN))
         else:
             print(f"  {line}")
-    if len(lines) > 30:
-        print(colorize(f"  ... ({len(lines) - 30} more lines)", Colors.DIM))
     print(colorize("  ── END PATCH ──", sc))
+
+
+def _verify_patch_in_docker(workdir: Path) -> str:
+    """Verify patch visible in Docker. Touch modified files for recompile."""
+    cdir = f"{config.D4J_CONTAINER_WORKSPACE}/{workdir.name}"
+    rc, diff_out, _ = d4j.shell(f"cd {cdir} && git diff", workdir=None)
+    diff_text = diff_out.strip() if diff_out else ""
+    if diff_text:
+        for line in diff_text.splitlines():
+            m = re.match(r'\+\+\+ b/(.*)', line)
+            if m:
+                d4j.shell(f"touch {cdir}/{m.group(1)}", workdir=None)
+    return diff_text
+
+
+def _clean_build_artifacts(workdir: Path):
+    """Remove compiled classes to force full recompile."""
+    cdir = f"{config.D4J_CONTAINER_WORKSPACE}/{workdir.name}"
+    d4j.shell(
+        f"cd {cdir} && rm -rf build/classes build/tests "
+        f"target/classes target/test-classes bin/ 2>/dev/null; true",
+        workdir=None)
+
+
+def _check_resume(out_dir: Path) -> dict:
+    """Check if a previous run exists and can be resumed.
+    Returns existing result dict if terminal, None otherwise.
+    """
+    result_file = out_dir / "result.json"
+    if not result_file.exists():
+        return None
+    try:
+        existing = json.loads(result_file.read_text())
+        status = existing.get("status", "")
+        if status in ("repaired", "unrepaired"):
+            return existing  # terminal — skip
+        # Non-terminal (error, partial) — will re-run
+        return None
+    except Exception:
+        return None
 
 
 def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path,
@@ -94,6 +132,13 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path,
 
     effective_max = max_attempts or config.MAX_ATTEMPTS_PER_BUG
     effective_fl = fl_mode or config.FL_MODE
+
+    # ── Resume check ──
+    existing = _check_resume(out_dir)
+    if existing is not None:
+        _v(f"\n [SKIP] {bug_name} | {baseline}: already {existing['status']} "
+           f"(attempts={existing.get('attempts_used',0)})", Colors.CYAN)
+        return existing
 
     trace = TraceWriter(out_dir / "trace.jsonl")
     llm = LLMClient(baseline, bug_name, verbose=llm_verbose)
@@ -148,18 +193,16 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path,
     trigger_tests = get_trigger_tests(workdir, project)
     init_git_baseline(workdir)
 
-    # ── 4. Get failure info (from Docker container, NOT local files) ──
+    # ── 4. Failure info from Docker ──
     fail_info = d4j.get_fail_info_from_container(workdir, project)
     if fail_info:
         _v(f"  Failure info: {len(fail_info)} test(s) with traces", Colors.CYAN)
     else:
-        _v("  ⚠ No failure info (failing_tests file missing in container)", Colors.YELLOW)
+        _v("  ⚠ No failure info", Colors.YELLOW)
 
-    # ── 5. Build test log for stack-trace FL ──
-    # Get test log with stack traces from Docker
+    # ── 5. Test log for FL ──
     test_log = d4j.get_test_log_with_traces(workdir, project)
     if "\tat" not in test_log:
-        # Supplement with fail_info if we have it
         for tc_sig, info in fail_info.items():
             test_log += f"--- {tc_sig}\n"
             test_log += (info or {}).get("error_message", "") + "\n"
@@ -172,8 +215,7 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path,
     if loc_hits:
         _v(f"  FL[{effective_fl}]: {len(loc_hits)} location(s)", Colors.CYAN)
         for h in loc_hits:
-            _v(f"    {h.filepath} L{h.start_line}-{h.end_line} (conf={h.confidence:.2f})",
-               Colors.DIM)
+            _v(f"    {h.filepath} L{h.start_line}-{h.end_line} (conf={h.confidence:.2f})", Colors.DIM)
     else:
         _v(f"  ⚠ FL[{effective_fl}]: no locations found", Colors.RED)
 
@@ -184,21 +226,25 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path,
         result["attempts_used"] = attempt
         _v(f"\n  [ATTEMPT {attempt}/{effective_max}]", Colors.BOLD + Colors.YELLOW)
 
-        # a) Generate patch
+        # a) Generate patch (with LLM retry handled inside llm_client)
         try:
             patch_result = gen.generate_patch(
                 bug_name, workdir, fail_info, trigger_tests, loc_hits,
                 attempt, out_dir, llm)
         except BudgetExceededError as e:
             _v(f"  Budget exceeded: {e}", Colors.RED)
-            trace.log({"bug": bug_name, "baseline": baseline, "attempt": attempt,
-                       "phase": "patch_gen", "status": "FAIL", "reason_code": reason.TIMEOUT})
             break
+        except Exception as e:
+            # Catch any remaining errors (network, etc.) — log and continue
+            _v(f"  ⚠ Patch gen error: {e}", Colors.RED)
+            result["attempt_summaries"].append(
+                {"attempt": attempt, "status": "PATCH_GEN_ERROR", "detail": str(e)[:200]})
+            continue
 
         _save_attempt(patch_result, attempt, out_dir)
 
         if not patch_result.diff_text:
-            _vstatus("patch_gen", "FAIL", "Empty patch (no diff produced)")
+            _vstatus("patch_gen", "FAIL", "Empty patch")
             result["attempt_summaries"].append({"attempt": attempt, "status": "EMPTY_DIFF"})
             if baseline == "reflexion" and hasattr(gen, "update_feedback"):
                 gen.update_feedback("empty_patch", "No patch generated.")
@@ -215,7 +261,7 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path,
                 {"attempt": attempt, "status": "BUDGET_FAIL", "reason_code": reason.PATCH_SCOPE_VIOLATION})
             continue
 
-        # c) Apply patch
+        # c) Apply patch on HOST
         t0 = time.monotonic()
         ok, err = apply_patch(patch_result.diff_text, workdir)
         v_time["apply_patch"] += time.monotonic() - t0
@@ -230,7 +276,19 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path,
             continue
         _vstatus("apply_patch", "OK")
 
-        # d) Compile
+        # d) Verify patch visible in Docker + touch files
+        docker_diff = _verify_patch_in_docker(workdir)
+        if docker_diff:
+            _vstatus("docker_diff", "OK", f"{len(docker_diff.splitlines())} lines changed")
+        else:
+            _vstatus("docker_diff", "FAIL", "Patch not visible in Docker")
+            result["attempt_summaries"].append(
+                {"attempt": attempt, "status": "PATCH_NOT_VISIBLE_IN_DOCKER"})
+            rollback(workdir)
+            continue
+
+        # e) Clean build artifacts + compile
+        _clean_build_artifacts(workdir)
         t0 = time.monotonic()
         ok, build_log = d4j.compile(
             workdir, project, log_path=out_dir / "logs" / f"attempt_{attempt:03d}_compile.log")
@@ -239,17 +297,16 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path,
             rc = reason.parse_build_reason(build_log)
             _vstatus("compile", "FAIL", f"{rc}: {build_log[-200:]}")
             result["attempt_summaries"].append(
-                {"attempt": attempt, "status": reason.BUILD_FAILED, "reason_code": rc,
-                 "detail": build_log[-300:]})
+                {"attempt": attempt, "status": reason.BUILD_FAILED, "reason_code": rc})
             if baseline == "reflexion" and hasattr(gen, "update_feedback"):
                 gen.update_feedback("build_failed", f"Compile failed: {build_log[:200]}")
             rollback(workdir)
             continue
         _vstatus("compile", "OK")
 
-        # e) Functionality tests
+        # f) Functionality tests
         t0 = time.monotonic()
-        n_func, still_failing, _ = run_functionality_tests(
+        n_func, still_failing, func_log = run_functionality_tests(
             workdir, trigger_tests, project,
             log_path=out_dir / "logs" / f"attempt_{attempt:03d}_func.log")
         v_time["func_test"] += time.monotonic() - t0
@@ -257,15 +314,14 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path,
             _vstatus("func_test", "FAIL", f"{n_func} test(s) still failing: {still_failing[:3]}")
             result["attempt_summaries"].append(
                 {"attempt": attempt, "status": reason.FUNCTIONALITY_FAILED,
-                 "reason_code": reason.TRIGGER_TEST_STILL_FAILING,
-                 "detail": str(still_failing[:3])})
+                 "reason_code": reason.TRIGGER_TEST_STILL_FAILING})
             if baseline == "reflexion" and hasattr(gen, "update_feedback"):
                 gen.update_feedback("func_failed", f"Tests failing: {still_failing[:3]}")
             rollback(workdir)
             continue
         _vstatus("func_test", "PASS")
 
-        # f) Regression tests
+        # g) Regression tests
         t0 = time.monotonic()
         n_reg, reg_failing, _ = run_regression_tests(
             workdir, project,
@@ -273,26 +329,22 @@ def run_bug(project: str, bug_id: str, baseline: str, out_dir: Path,
         v_time["reg_test"] += time.monotonic() - t0
         new_failures = set(reg_failing) - set(failing_before)
         if new_failures:
-            _vstatus("reg_test", "FAIL", f"{len(new_failures)} new failure(s): {list(new_failures)[:3]}")
+            _vstatus("reg_test", "FAIL", f"{len(new_failures)} new failure(s)")
             result["attempt_summaries"].append(
                 {"attempt": attempt, "status": reason.REGRESSION_FAILED,
-                 "reason_code": reason.NEW_FAILURES_INTRODUCED,
-                 "detail": str(list(new_failures)[:3])})
+                 "reason_code": reason.NEW_FAILURES_INTRODUCED})
             if baseline == "reflexion" and hasattr(gen, "update_feedback"):
                 gen.update_feedback("regression", f"New failures: {list(new_failures)[:3]}")
             rollback(workdir)
             continue
         _vstatus("reg_test", "PASS")
 
-        # g) REPAIRED ✓
+        # h) REPAIRED ✓
         (out_dir / "patch.diff").write_text(patch_result.diff_text)
-        trace.log({"bug": bug_name, "baseline": baseline, "attempt": attempt,
-                   "phase": "reg_test", "status": "OK", "reason_code": reason.REPAIRED})
         result["status"] = "repaired"
         result["failing_count_after"] = 0
         result["attempt_summaries"].append({"attempt": attempt, "status": reason.REPAIRED})
         _v(f"\n  ★ REPAIRED at attempt {attempt}!", Colors.BOLD + Colors.GREEN)
-        _vpatch(patch_result.diff_text, "FINAL")
         break
 
     # ── Finalize ──

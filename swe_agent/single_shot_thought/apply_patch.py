@@ -115,82 +115,152 @@ def apply_patch(diff_text: str, workdir: Path) -> Tuple[bool, str]:
 
 def apply_search_replace(search_replace_text: str, workdir: Path) -> Tuple[bool, str]:
     """
-    Apply a search-replace format patch.
+    Apply a search-replace format patch. Handles BOTH formats:
+      Format A: SEARCH:\n<content>   (content starts on NEXT line)
+      Format B: SEARCH: <content>    (content starts on SAME line after space)
     Returns (success, error_message).
     """
-    import re
-    # Match explicit newline after SEARCH: and REPLACE: to preserve leading whitespace in content
-    # Pattern: FILE: <path>\nSEARCH:\n<content>\nREPLACE:\n<content>
-    pattern = r'FILE:\s*(\S+)\s*SEARCH:\n(.*?)\nREPLACE:\n(.*?)(?=\nFILE:|\Z)'
-    matches = re.findall(pattern, search_replace_text, re.DOTALL)
-
-    if not matches:
+    blocks = _parse_search_replace_blocks(search_replace_text)
+    if not blocks:
         return False, "No valid SEARCH/REPLACE blocks found"
 
-    for filepath, search_text, replace_text in matches:
-        # Strip only trailing whitespace to preserve leading indentation on each line
+    for filepath, search_text, replace_text in blocks:
         search_text = search_text.rstrip()
         replace_text = replace_text.rstrip()
 
-        full_path = workdir / filepath
-        if not full_path.exists():
-            # Try to find the file
-            for p in workdir.rglob(filepath.split('/')[-1]):
-                if p.is_file():
-                    full_path = p
-                    break
-            else:
-                return False, f"File not found: {filepath}"
+        if not search_text:
+            return False, f"Empty SEARCH block for {filepath}"
+
+        full_path = _find_file(workdir, filepath)
+        if full_path is None:
+            return False, f"File not found: {filepath}"
 
         try:
             content = full_path.read_text()
-            search_lines = search_text.split('\n')
-            replace_lines = replace_text.split('\n')
-            content_lines = content.split('\n')
-
-            # Find exact match first
-            start_idx = -1
-            for i in range(len(content_lines) - len(search_lines) + 1):
-                if all(content_lines[i + j] == search_lines[j] for j in range(len(search_lines))):
-                    start_idx = i
-                    break
-
-            if start_idx == -1:
-                # Try fuzzy match (strip whitespace for comparison)
-                search_stripped = [l.strip() for l in search_lines]
-                for i in range(len(content_lines) - len(search_lines) + 1):
-                    if all(content_lines[i + j].strip() == search_stripped[j] for j in range(len(search_lines))):
-                        start_idx = i
-                        break
-
-            if start_idx == -1:
+            new_content = _do_search_replace(content, search_text, replace_text)
+            if new_content is None:
                 return False, f"Could not find SEARCH text in {filepath}"
-
-            # Apply the replacement with indentation preservation
-            end_idx = start_idx + len(search_lines)
-            new_content_lines = []
-            for j, replace_line in enumerate(replace_lines):
-                if start_idx + j < len(content_lines):
-                    original_line = content_lines[start_idx + j]
-                    original_indent = len(original_line) - len(original_line.lstrip())
-                    original_whitespace = original_line[:original_indent]
-                    replace_stripped = replace_line.lstrip()
-                    new_content_lines.append(original_whitespace + replace_stripped)
-                else:
-                    new_content_lines.append(replace_line)
-
-            final_content_lines = content_lines[:start_idx] + new_content_lines + content_lines[end_idx:]
-            original_ending = '\n' if content.endswith('\n') else ''
-            new_content = '\n'.join(final_content_lines)
-            if original_ending and not new_content.endswith('\n'):
-                new_content += '\n'
             full_path.write_text(new_content)
             return True, ""
-
         except Exception as e:
-            return False, f"Error applying patch to {filepath}: {str(e)}"
+            return False, f"Error applying patch to {filepath}: {e}"
 
     return True, ""
+
+
+def _parse_search_replace_blocks(text: str) -> List[Tuple[str, str, str]]:
+    """Parse FILE/SEARCH/REPLACE blocks from LLM output.
+    Handles both 'SEARCH:\\ncontent' and 'SEARCH: content' formats.
+    Returns list of (filepath, search_text, replace_text).
+    """
+    blocks = []
+
+    # Split on FILE: markers
+    import re
+    file_parts = re.split(r'(?:^|\n)\s*FILE:\s*', text)
+    for part in file_parts:
+        if not part.strip():
+            continue
+
+        # Extract filepath (first non-empty line or first word)
+        lines = part.split('\n')
+        filepath = lines[0].strip()
+        rest = '\n'.join(lines[1:]) if len(lines) > 1 else ''
+
+        # If filepath line also contains SEARCH:, handle inline
+        if 'SEARCH:' in filepath:
+            filepath_end = filepath.index('SEARCH:')
+            rest = filepath[filepath_end:] + '\n' + rest
+            filepath = filepath[:filepath_end].strip()
+
+        # Now find SEARCH: and REPLACE: in the rest
+        search_text, replace_text = _split_search_replace(rest)
+        if search_text is not None:
+            blocks.append((filepath, search_text, replace_text or ""))
+
+    return blocks
+
+
+def _split_search_replace(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """Split text into (search_content, replace_content).
+    Handles:
+      SEARCH:\\n<lines>\\nREPLACE:\\n<lines>
+      SEARCH: <lines>\\nREPLACE: <lines>
+    """
+    import re
+
+    # Find SEARCH: and REPLACE: positions
+    search_match = re.search(r'SEARCH:\s*', text, re.IGNORECASE)
+    replace_match = re.search(r'REPLACE:\s*', text, re.IGNORECASE)
+
+    if not search_match or not replace_match:
+        return None, None
+
+    # Content after SEARCH: up to REPLACE:
+    search_start = search_match.end()
+    replace_keyword_start = replace_match.start()
+    search_content = text[search_start:replace_keyword_start].strip()
+
+    # Content after REPLACE: to end (or next FILE:)
+    replace_start = replace_match.end()
+    # Find end: next FILE: or end of text
+    next_file = re.search(r'\nFILE:', text[replace_start:], re.IGNORECASE)
+    if next_file:
+        replace_content = text[replace_start:replace_start + next_file.start()].strip()
+    else:
+        replace_content = text[replace_start:].strip()
+
+    return search_content, replace_content
+
+
+def _do_search_replace(content: str, search_text: str, replace_text: str) -> Optional[str]:
+    """Apply search/replace to file content. Returns new content or None if not found."""
+    # Strategy 1: exact match
+    if search_text in content:
+        return content.replace(search_text, replace_text, 1)
+
+    # Strategy 2: fuzzy match (strip whitespace per line)
+    search_lines = search_text.split('\n')
+    content_lines = content.split('\n')
+
+    for i in range(len(content_lines) - len(search_lines) + 1):
+        if all(content_lines[i + j].strip() == search_lines[j].strip()
+               for j in range(len(search_lines))):
+            # Found fuzzy match — preserve original indentation
+            replace_lines = replace_text.split('\n')
+            new_lines = content_lines[:i]
+            for j, rl in enumerate(replace_lines):
+                if j < len(search_lines) and (i + j) < len(content_lines):
+                    # Preserve indentation from original line
+                    orig = content_lines[i + j]
+                    indent = len(orig) - len(orig.lstrip())
+                    new_lines.append(orig[:indent] + rl.lstrip())
+                else:
+                    new_lines.append(rl)
+            new_lines.extend(content_lines[i + len(search_lines):])
+            return '\n'.join(new_lines)
+
+    return None
+
+
+def _find_file(workdir: Path, filepath: str) -> Optional[Path]:
+    """Find a file in workdir with fallback search."""
+    full = workdir / filepath
+    if full.exists() and full.is_file():
+        return full
+    # Search by filename
+    fname = filepath.split('/')[-1]
+    for p in workdir.rglob(fname):
+        if p.is_file() and '/test/' not in str(p) and 'Test' not in p.name:
+            return p
+    # Strip path components
+    if '/' in filepath:
+        parts = filepath.split('/')
+        for i in range(len(parts)):
+            test = workdir / '/'.join(parts[i:])
+            if test.exists() and test.is_file():
+                return test
+    return None
 
 
 def apply_patch_manually(diff_text: str, workdir: Path) -> Tuple[bool, str]:

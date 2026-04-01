@@ -16,7 +16,7 @@ D4J_REQUEST_TIMEOUT  = int(os.environ.get("D4J_REQUEST_TIMEOUT", "1800"))
 
 # ── LLM endpoint ──────────────────────────────────────────────────────────
 OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY",      "11")
-OPENAI_API_BASE_URL = os.environ.get("OPENAI_API_BASE_URL", "https://api.ai2wj.com/v1/")
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.ai2wj.com/v1/")
 GPT_MODEL           = os.environ.get("GPT_MODEL",           "gpt-5.1")
 
 # ── Budget (pass@k: k = MAX_ATTEMPTS_PER_BUG) ─────────────────────────────

@@ -6,7 +6,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # ── Defects4J Docker Web API (the ONLY way we talk to defects4j) ───────────
 # All defects4j commands (checkout, compile, test) go through the webapp.
 # NO local defects4j installation needed.
-D4J_URL              = os.environ.get("D4J_URL", "http://127.0.0.1:8090")
+D4J_URL              = os.environ.get("D4J_URL", "http://127.0.0.1:8091")
 D4J_LOCAL_WORKSPACE  = os.environ.get("D4J_LOCAL_WORKSPACE", "")
 D4J_CONTAINER_WORKSPACE = os.environ.get("D4J_CONTAINER_WORKSPACE", "/workspace")
 D4J_REQUEST_TIMEOUT  = int(os.environ.get("D4J_REQUEST_TIMEOUT", "1800"))

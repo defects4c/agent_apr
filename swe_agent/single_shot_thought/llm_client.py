@@ -1,10 +1,13 @@
 # swe_agent/llm_client.py
-import hashlib, json, time
+import hashlib, json, time, traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from openai import OpenAI
 from .config import (OPENAI_API_KEY, OPENAI_API_BASE_URL, GPT_MODEL,
                      MAX_LLM_CALLS_PER_BUG, MAX_TOKENS_PER_BUG)
+
+MAX_RETRIES = 5
+RETRY_BACKOFF = [10, 30, 60, 120, 300]  # seconds
 
 
 class Colors:
@@ -12,7 +15,6 @@ class Colors:
     RED = "\033[91m"; GREEN = "\033[92m"; YELLOW = "\033[93m"
     BLUE = "\033[94m"; MAGENTA = "\033[95m"; CYAN = "\033[96m"
     WHITE = "\033[97m"; GRAY = "\033[90m"
-    BG_BLUE = "\033[44m"; BG_MAGENTA = "\033[45m"; BG_CYAN = "\033[46m"
 
 
 def colorize(text: str, color: str) -> str:
@@ -24,7 +26,7 @@ class BudgetExceededError(Exception):
 
 
 class LLMClient:
-    """ONE instance per (baseline, bug). All baselines must use this."""
+    """ONE instance per (baseline, bug). Retries on 5xx / connection errors."""
 
     def __init__(self, baseline: str, bug_id: str, verbose: bool = False):
         self.baseline = baseline
@@ -38,12 +40,6 @@ class LLMClient:
     def chat(self, messages: list, purpose: str, attempt: int,
              out_dir: Path, max_tokens: int = 1000,
              temperature: float = None) -> str:
-        """Make an LLM call.
-
-        Args:
-            temperature: If None, uses model default (typically 0 for deterministic).
-                         Set >0 (e.g. 0.7) for Self-Consistency sampling.
-        """
         self._check_budget()
         prompt_hash = hashlib.sha256(json.dumps(messages).encode()).hexdigest()
         ts_start = datetime.now(timezone.utc)
@@ -64,7 +60,34 @@ class LLMClient:
         if temperature is not None:
             kwargs["temperature"] = temperature
 
-        response = self._client.chat.completions.create(**kwargs)
+        # ── Retry loop with exponential backoff ──
+        response = None
+        last_error = None
+        for retry_idx in range(MAX_RETRIES + 1):
+            try:
+                response = self._client.chat.completions.create(**kwargs)
+                break  # success
+            except Exception as e:
+                last_error = e
+                err_str = str(e)
+                is_retryable = any(k in err_str for k in [
+                    "502", "503", "504", "500", "Bad Gateway",
+                    "Service Unavailable", "Gateway Timeout",
+                    "Connection", "Timeout", "ECONNRESET",
+                    "InternalServerError", "nginx",
+                ])
+                if not is_retryable or retry_idx >= MAX_RETRIES:
+                    raise
+                wait = RETRY_BACKOFF[min(retry_idx, len(RETRY_BACKOFF) - 1)]
+                print(colorize(
+                    f"  ⚠ LLM error (retry {retry_idx+1}/{MAX_RETRIES}, "
+                    f"wait {wait}s): {err_str[:120]}",
+                    Colors.YELLOW))
+                time.sleep(wait)
+
+        if response is None:
+            raise last_error or RuntimeError("LLM call failed with no response")
+
         latency = time.monotonic() - t0
         usage = self._parse_usage(response)
         self._update_counters(usage, latency)
